@@ -2,6 +2,10 @@ import os
 
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test.db"
 
+import fakeredis.aioredis  # noqa: E402
+import app.core.redis as redis_mod  # noqa: E402
+
+
 import pytest_asyncio  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
@@ -22,3 +26,7 @@ async def fresh_db():
 async def client():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
+
+@pytest_asyncio.fixture(autouse=True)
+async def fake_redis(monkeypatch):
+    monkeypatch.setattr(redis_mod, "redis_client", fakeredis.aioredis.FakeRedis(decode_responses=True))

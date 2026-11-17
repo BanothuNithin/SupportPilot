@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     jwt_secret: str = "dev-secret-change-me-use-32-chars-min!!"
     jwt_algorithm: str = "HS256"
-    jwt_expire_minutes: int = 60
+    jwt_expire_minutes: int = 15
 
 
 settings = Settings()

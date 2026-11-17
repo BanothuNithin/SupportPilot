@@ -15,8 +15,50 @@ async def test_login(client):
     await register(client, "Acme Inc", "owner@acme.com")
     r = await client.post("/api/v1/auth/login", data={"username": "owner@acme.com", "password": "password123"})
     assert r.status_code == 200
+    assert r.json()["refresh_token"]
     bad = await client.post("/api/v1/auth/login", data={"username": "owner@acme.com", "password": "wrong-pass"})
     assert bad.status_code == 401
+
+
+async def test_refresh_rotates_token_and_rejects_unknown_token(client):
+    registered = await client.post(
+        "/api/v1/auth/register",
+        json={"company_name": "Acme", "email": "owner@acme.com", "password": "password123"},
+    )
+    old_refresh_token = registered.json()["refresh_token"]
+
+    refreshed = await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": old_refresh_token}
+    )
+    assert refreshed.status_code == 200
+    new_refresh_token = refreshed.json()["refresh_token"]
+    assert new_refresh_token != old_refresh_token
+
+    rejected = await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": old_refresh_token}
+    )
+    assert rejected.status_code == 401
+    unknown = await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": "unknown-token"}
+    )
+    assert unknown.status_code == 401
+
+
+async def test_logout_revokes_refresh_token(client):
+    registered = await client.post(
+        "/api/v1/auth/register",
+        json={"company_name": "Acme", "email": "owner@acme.com", "password": "password123"},
+    )
+    refresh_token = registered.json()["refresh_token"]
+
+    logged_out = await client.post(
+        "/api/v1/auth/logout", json={"refresh_token": refresh_token}
+    )
+    assert logged_out.status_code == 204
+    rejected = await client.post(
+        "/api/v1/auth/refresh", json={"refresh_token": refresh_token}
+    )
+    assert rejected.status_code == 401
 
 
 async def test_duplicate_email(client):
