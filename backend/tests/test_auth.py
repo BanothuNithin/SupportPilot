@@ -20,6 +20,18 @@ async def test_login(client):
     assert bad.status_code == 401
 
 
+async def test_login_rate_limit(client):
+    await register(client, "Acme Inc", "owner@acme.com")
+    results = []
+    for _ in range(6):
+        response = await client.post(
+            "/api/v1/auth/login",
+            data={"username": "owner@acme.com", "password": "wrong-password"},
+        )
+        results.append(response.status_code)
+    assert results == [401, 401, 401, 401, 401, 429]
+
+
 async def test_refresh_rotates_token_and_rejects_unknown_token(client):
     registered = await client.post(
         "/api/v1/auth/register",
