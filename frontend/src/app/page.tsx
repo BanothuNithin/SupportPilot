@@ -23,6 +23,7 @@ export default function ChatPage() {
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Any API call can fail with AuthError; send the user to the login page.
   const handleError = useCallback(
@@ -85,15 +86,19 @@ export default function ChatPage() {
     setInput("");
     setError("");
     setStreaming(true);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     // show the customer message and an empty AI bubble immediately, then fill the bubble token by token
     setMessages((m) => [...m, { id: `u-${Date.now()}`, sender: "customer", content: text }, { id: "streaming", sender: "ai", content: "" }]);
     try {
       await streamMessage(activeId, text, (token) =>
         setMessages((m) => m.map((x) => (x.id === "streaming" ? { ...x, content: x.content + token } : x))),
+        controller.signal,
       );
     } catch (err) {
-      handleError(err);
+      if (!controller.signal.aborted) handleError(err);
     } finally {
+      if (abortControllerRef.current === controller) abortControllerRef.current = null;
       setStreaming(false);
       if (activeId) setMessages(await getMessages(activeId).catch(() => []));
     }
@@ -152,9 +157,19 @@ export default function ChatPage() {
             placeholder={activeId ? "Type a message..." : "Create a chat first"}
             className="flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 outline-none focus:border-violet-500 disabled:opacity-50"
           />
-          <button disabled={!activeId || streaming || !input.trim()} className="rounded-lg bg-violet-600 px-5 font-semibold hover:bg-violet-500 disabled:opacity-50">
-            Send
-          </button>
+          {streaming ? (
+            <button
+              type="button"
+              onClick={() => abortControllerRef.current?.abort()}
+              className="rounded-lg bg-red-600 px-5 font-semibold hover:bg-red-500"
+            >
+              Stop
+            </button>
+          ) : (
+            <button disabled={!activeId || !input.trim()} className="rounded-lg bg-violet-600 px-5 font-semibold hover:bg-violet-500 disabled:opacity-50">
+              Send
+            </button>
+          )}
         </form>
       </main>
     </div>

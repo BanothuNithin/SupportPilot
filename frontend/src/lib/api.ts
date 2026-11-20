@@ -139,11 +139,17 @@ export async function createConversation(): Promise<Conversation> {
 
 // ---- streaming ----
 // EventSource cannot send POST bodies or an Authorization header, so we read the stream manually.
-export async function streamMessage(conversationId: string, content: string, onToken: (text: string) => void) {
+export async function streamMessage(
+  conversationId: string,
+  content: string,
+  onToken: (text: string) => void,
+  signal?: AbortSignal,
+) {
   const r = await authFetch(`/conversations/${conversationId}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
+    signal,
   });
   if (!r.ok || !r.body) throw new Error(`Request failed (${r.status})`);
 

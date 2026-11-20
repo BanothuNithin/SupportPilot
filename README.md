@@ -4,7 +4,7 @@
 
 **A multi-tenant, agentic AI customer support platform.** Companies upload their docs, AI agents answer customers with citations, take approved actions (GitHub issue, Slack alert) through MCP tools, and escalate to a human when confidence is low.
 
-> **Status: Week 1 of 8 complete.** The foundation (multi-tenant data model, auth, RBAC, tenant-scoped API, migrations, CI) is built and tested. AI features land in Weeks 2-8. I'm building this in public; see the roadmap below.
+> **Status: Week 2 of 8.** The foundation (multi-tenant data model, auth, RBAC, tenant-scoped API, migrations, CI) is built and tested. The Next.js chat UI and SSE streaming are underway. I'm building this in public; see the roadmap below.
 
 ![Architecture](docs/architecture.png)
 
@@ -15,7 +15,7 @@ Most AI support bots only answer questions. Real support needs three more things
 2. **Reliable answers:** cite sources, and say "I don't know" (and hand over to a human) instead of guessing.
 3. **Action:** a bug report should create a ticket and alert the team, with human approval for risky steps.
 
-## What works today (Week 1)
+## What works today (Week 2)
 - Tenant registration: creating a company also creates its owner
 - JWT access tokens (15 min) plus refresh tokens with **rotation**, stored hashed in Redis; logout revokes them
 - Role-based access control: `owner`, `admin`, `agent`
@@ -24,6 +24,8 @@ Most AI support bots only answer questions. Real support needs three more things
 - PostgreSQL schema managed with Alembic migrations
 - 17 automated tests, including tenant-isolation tests, run in GitHub Actions
 - Docker Compose for PostgreSQL, Redis, Qdrant and MinIO
+- Next.js chat UI with SSE replies and a Stop button to cancel generation
+- Frontend lint and production build checks in GitHub Actions
 
 ## Tech stack
 | Layer | Technology | Status |

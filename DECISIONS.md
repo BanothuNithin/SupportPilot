@@ -41,3 +41,26 @@ Each entry: what I chose, what I rejected, and what it costs.
 ## 10. Bug lesson: patch a name where it is looked up
 - `from module import client` copies the name at import time, so monkeypatching the module did not affect code that had already imported it, and tests silently hit a real Redis.
 - **Fix:** modules read `redis_module.redis_client` at call time, so a single patch covers every user.
+
+## 11. Server-Sent Events for chat streaming
+- **Chose:** stream assistant output over SSE. The browser sends an authenticated HTTP POST and reads its event stream.
+- **Rejected:** WebSockets, which add a persistent bidirectional connection that chat replies do not need.
+- **Cost:** SSE is one-way; future client-to-server live events would need another request or a different transport.
+
+## 12. OpenAI-compatible model provider
+- **Chose:** one provider implementation for servers that expose the OpenAI chat-completions API, including Ollama, OpenAI, vLLM, and LM Studio.
+- **Why:** a common request/streaming format makes it easy to change model servers without coupling chat code to one vendor.
+- **Cost:** compatibility is limited to the API features each server implements.
+
+## 13. Fake provider for tests
+- **Chose:** a deterministic fake LLM provider for tests and local development without model credentials or network access.
+- **Cost:** canned responses verify integration and streaming behavior, not answer quality or model performance.
+
+## 14. Store frontend tokens in `localStorage` for now
+- **Chose:** keep access and refresh tokens in `localStorage` to make the current browser client simple.
+- **Trade-off:** JavaScript can read these tokens, so an XSS vulnerability could expose them. Secure, HttpOnly cookies would reduce that exposure, but require a cookie and CSRF design.
+
+## 15. Share one in-flight refresh across requests
+- **Chose:** all concurrent API calls that encounter an expired access token await the same refresh promise.
+- **Why:** refresh tokens rotate and are single-use; parallel refreshes with the same token could invalidate the session.
+- **Cost:** callers wait for the refresh already in progress instead of starting their own refresh request.
