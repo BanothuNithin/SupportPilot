@@ -1,0 +1,162 @@
+"use client";
+
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  AuthError,
+  Conversation,
+  Message,
+  createConversation,
+  getMessages,
+  getTokens,
+  listConversations,
+  logout,
+  streamMessage,
+} from "@/lib/api";
+
+export default function ChatPage() {
+  const router = useRouter();
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState("");
+  const [streaming, setStreaming] = useState(false);
+  const [error, setError] = useState("");
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Any API call can fail with AuthError; send the user to the login page.
+  const handleError = useCallback(
+    (e: unknown) => {
+      if (e instanceof AuthError) router.replace("/login");
+      else setError(e instanceof Error ? e.message : "Something went wrong.");
+    },
+    [router],
+  );
+
+  const openConversation = useCallback(
+    async (id: string) => {
+      setActiveId(id);
+      setError("");
+      try {
+        setMessages(await getMessages(id));
+      } catch (e) {
+        handleError(e);
+      }
+    },
+    [handleError],
+  );
+
+  useEffect(() => {
+    if (!getTokens()) {
+      router.replace("/login");
+      return;
+    }
+    (async () => {
+      try {
+        const list = await listConversations();
+        setConversations(list);
+        if (list[0]) await openConversation(list[0].id);
+      } catch (e) {
+        handleError(e);
+      }
+    })();
+  }, [router, handleError, openConversation]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  async function newChat() {
+    try {
+      const conv = await createConversation();
+      setConversations((c) => [conv, ...c]);
+      setActiveId(conv.id);
+      setMessages([]);
+      setError("");
+    } catch (e) {
+      handleError(e);
+    }
+  }
+
+  async function send(e: React.FormEvent) {
+    e.preventDefault();
+    const text = input.trim();
+    if (!text || !activeId || streaming) return;
+    setInput("");
+    setError("");
+    setStreaming(true);
+    // show the customer message and an empty AI bubble immediately, then fill the bubble token by token
+    setMessages((m) => [...m, { id: `u-${Date.now()}`, sender: "customer", content: text }, { id: "streaming", sender: "ai", content: "" }]);
+    try {
+      await streamMessage(activeId, text, (token) =>
+        setMessages((m) => m.map((x) => (x.id === "streaming" ? { ...x, content: x.content + token } : x))),
+      );
+    } catch (err) {
+      handleError(err);
+    } finally {
+      setStreaming(false);
+      if (activeId) setMessages(await getMessages(activeId).catch(() => []));
+    }
+  }
+
+  async function signOut() {
+    await logout();
+    router.replace("/login");
+  }
+
+  return (
+    <div className="flex h-screen bg-slate-950 text-slate-100">
+      <aside className="flex w-64 flex-col border-r border-slate-800 bg-slate-900/50">
+        <div className="p-4 text-lg font-bold">SupportPilot</div>
+        <button onClick={newChat} className="mx-3 mb-3 rounded-lg bg-violet-600 py-2 text-sm font-semibold hover:bg-violet-500">
+          + New chat
+        </button>
+        <div className="flex-1 space-y-1 overflow-y-auto px-3">
+          {conversations.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => openConversation(c.id)}
+              className={`w-full truncate rounded-lg px-3 py-2 text-left text-sm ${c.id === activeId ? "bg-slate-800" : "hover:bg-slate-800/60"}`}
+            >
+              Chat {new Date(c.created_at).toLocaleString()}
+            </button>
+          ))}
+        </div>
+        <button onClick={signOut} className="m-3 rounded-lg border border-slate-700 py-2 text-sm text-slate-300 hover:bg-slate-800">
+          Sign out
+        </button>
+      </aside>
+
+      <main className="flex flex-1 flex-col">
+        <div className="flex-1 space-y-4 overflow-y-auto p-6">
+          {!activeId && <p className="text-slate-400">Create a new chat to start.</p>}
+          {messages.map((m) => (
+            <div key={m.id} className={`flex ${m.sender === "customer" ? "justify-end" : "justify-start"}`}>
+              <div
+                className={`max-w-xl whitespace-pre-wrap rounded-2xl px-4 py-2 ${
+                  m.sender === "customer" ? "bg-violet-600 text-white" : "bg-slate-800 text-slate-100"
+                }`}
+              >
+                {m.content || (streaming && m.id === "streaming" ? "..." : "")}
+              </div>
+            </div>
+          ))}
+          <div ref={bottomRef} />
+        </div>
+        {error && <p className="px-6 pb-2 text-sm text-red-400">{error}</p>}
+        <form onSubmit={send} className="flex gap-2 border-t border-slate-800 p-4">
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            disabled={!activeId || streaming}
+            placeholder={activeId ? "Type a message..." : "Create a chat first"}
+            className="flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 outline-none focus:border-violet-500 disabled:opacity-50"
+          />
+          <button disabled={!activeId || streaming || !input.trim()} className="rounded-lg bg-violet-600 px-5 font-semibold hover:bg-violet-500 disabled:opacity-50">
+            Send
+          </button>
+        </form>
+      </main>
+    </div>
+  );
+}

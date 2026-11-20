@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret-change-me-use-32-chars-min!!"
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 15
+    # LLM: 'fake' (no model needed) or 'openai_compat' (Ollama, OpenAI, any compatible API)
+    llm_provider: str = "fake"
+    llm_base_url: str = "http://localhost:11434/v1"
+    llm_api_key: str = "ollama"
+    llm_model: str = "llama3.2"
 
 
 settings = Settings()

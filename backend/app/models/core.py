@@ -58,7 +58,9 @@ class Conversation(Base):
     customer_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("customers.id"))
     status: Mapped[str] = mapped_column(String(30), default="ai_handling")  # ai_handling | escalated | resolved
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    messages: Mapped[list["Message"]] = relationship(back_populates="conversation")
+    messages: Mapped[list["Message"]] = relationship(
+        back_populates="conversation", order_by="Message.created_at"
+    )
 
 
 class Message(Base):

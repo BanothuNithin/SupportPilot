@@ -1,6 +1,6 @@
 # SupportPilot
 
-![CI](https://github.com/YOUR-USERNAME/supportpilot/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/BanothuNithin/supportpilot/actions/workflows/ci.yml/badge.svg)
 
 **A multi-tenant, agentic AI customer support platform.** Companies upload their docs, AI agents answer customers with citations, take approved actions (GitHub issue, Slack alert) through MCP tools, and escalate to a human when confidence is low.
 
