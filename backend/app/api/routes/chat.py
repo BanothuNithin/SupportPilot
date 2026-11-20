@@ -1,11 +1,14 @@
 import json
 import logging
 import uuid
+from collections.abc import AsyncGenerator
 
+from anyio import CancelScope, get_cancelled_exc_class
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.types import Send
 
 from app.api.deps import get_current_user
 from app.api.tenant import get_owned
@@ -23,6 +26,24 @@ SYSTEM_PROMPT = (
     "Answer clearly and briefly. If you do not know the answer, say so honestly."
 )
 HISTORY_LIMIT = 20
+
+
+class DisconnectAwareStreamingResponse(StreamingResponse):
+    def __init__(self, content: AsyncGenerator[str, None], headers: dict[str, str]):
+        self.content_generator = content
+        super().__init__(content, media_type="text/event-stream", headers=headers)
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(send)
+        except OSError:
+            with CancelScope(shield=True):
+                await self.content_generator.aclose()
+            raise
+        except get_cancelled_exc_class():
+            with CancelScope(shield=True):
+                await self.content_generator.aclose()
+            raise
 
 
 def sse(event: str, data: dict) -> str:
@@ -56,12 +77,43 @@ async def send_message(
     ]
     llm_messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
 
+    async def save_answer(answer: str) -> str:
+        async with SessionLocal() as session:
+            msg = Message(tenant_id=tenant_id, conversation_id=conv_id, sender="ai", content=answer)
+            session.add(msg)
+            await session.commit()
+            return str(msg.id)
+
     async def event_stream():
         parts: list[str] = []
+        saved = False
+
+        async def save_partial() -> None:
+            nonlocal saved
+            answer = "".join(parts).strip()
+            if answer and not saved:
+                with CancelScope(shield=True):
+                    await save_answer(answer)
+                saved = True
+
         try:
             async for token in llm.stream(llm_messages):
                 parts.append(token)
                 yield sse("token", {"text": token})
+            answer = "".join(parts).strip()
+            if not answer:
+                yield sse("error", {"detail": "The model returned an empty answer."})
+                return
+            with CancelScope(shield=True):
+                message_id = await save_answer(answer)
+            saved = True
+            yield sse("done", {"message_id": message_id})
+        except get_cancelled_exc_class():
+            await save_partial()
+            raise
+        except GeneratorExit:
+            await save_partial()
+            raise
         except LLMError as e:
             yield sse("error", {"detail": str(e)})
             return
@@ -70,20 +122,7 @@ async def send_message(
             yield sse("error", {"detail": "The AI request failed."})
             return
 
-        answer = "".join(parts).strip()
-        if not answer:
-            yield sse("error", {"detail": "The model returned an empty answer."})
-            return
-        # The request-scoped session may be closed by now, so the stream opens its own.
-        async with SessionLocal() as session:
-            msg = Message(tenant_id=tenant_id, conversation_id=conv_id, sender="ai", content=answer)
-            session.add(msg)
-            await session.commit()
-            message_id = str(msg.id)
-        yield sse("done", {"message_id": message_id})
-
-    return StreamingResponse(
+    return DisconnectAwareStreamingResponse(
         event_stream(),
-        media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -25,6 +25,8 @@ export default function ChatPage() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  useEffect(() => () => abortControllerRef.current?.abort(), []);
+
   // Any API call can fail with AuthError; send the user to the login page.
   const handleError = useCallback(
     (e: unknown) => {
@@ -82,25 +84,37 @@ export default function ChatPage() {
   async function send(e: React.FormEvent) {
     e.preventDefault();
     const text = input.trim();
-    if (!text || !activeId || streaming) return;
+    if (!text || !activeId || streaming || abortControllerRef.current) return;
     setInput("");
     setError("");
     setStreaming(true);
     const controller = new AbortController();
+    const partialMessageId = `partial-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     abortControllerRef.current = controller;
     // show the customer message and an empty AI bubble immediately, then fill the bubble token by token
     setMessages((m) => [...m, { id: `u-${Date.now()}`, sender: "customer", content: text }, { id: "streaming", sender: "ai", content: "" }]);
+    let aborted = false;
     try {
       await streamMessage(activeId, text, (token) =>
         setMessages((m) => m.map((x) => (x.id === "streaming" ? { ...x, content: x.content + token } : x))),
         controller.signal,
       );
     } catch (err) {
-      if (!controller.signal.aborted) handleError(err);
+      aborted = controller.signal.aborted || (err instanceof Error && err.name === "AbortError");
+      if (aborted) {
+        setMessages((current) =>
+          current.flatMap((message) => {
+            if (message.id !== "streaming") return [message];
+            return message.content ? [{ ...message, id: partialMessageId }] : [];
+          }),
+        );
+      } else {
+        handleError(err);
+      }
     } finally {
       if (abortControllerRef.current === controller) abortControllerRef.current = null;
       setStreaming(false);
-      if (activeId) setMessages(await getMessages(activeId).catch(() => []));
+      if (!aborted && activeId) setMessages(await getMessages(activeId).catch(() => []));
     }
   }
 

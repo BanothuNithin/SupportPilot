@@ -1,9 +1,18 @@
+import uuid
 from typing import AsyncIterator
+
+import pytest
+from sqlalchemy import select
+from starlette.requests import ClientDisconnect
 
 from llm import get_llm
 from llm.base import LLMError
 from llm.fake import FakeProvider
+from app.api.routes.chat import send_message
+from app.db.session import SessionLocal
 from app.main import app
+from app.models import Conversation, User
+from app.schemas.message import MessageIn
 
 
 async def register(client, company, email):
@@ -57,6 +66,50 @@ async def test_chat_streams_and_saves_messages_in_order(client, monkeypatch):
     assert [message["sender"] for message in messages] == ["customer", "ai"]
     assert messages[0]["content"] == "Where is my order?"
     assert messages[1]["content"] == "This is a fake answer to: Where is my order?"
+
+
+async def test_chat_saves_partial_answer_when_client_disconnects(client):
+    class OneTokenProvider:
+        async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
+            yield "partial answer "
+
+    headers = await register(client, "Acme", "owner@acme.com")
+    conversation_id = await create_conversation(client, headers)
+
+    async with SessionLocal() as db:
+        conversation = await db.get(Conversation, uuid.UUID(conversation_id))
+        user = await db.scalar(select(User).where(User.email == "owner@acme.com"))
+        assert conversation is not None
+        assert user is not None
+
+        response = await send_message(
+            uuid.UUID(conversation_id),
+            MessageIn(content="Need help"),
+            user=user,
+            db=db,
+            llm=OneTokenProvider(),
+        )
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            raise OSError("client disconnected")
+
+    with pytest.raises(ClientDisconnect):
+        await response(
+            {"type": "http", "asgi": {"spec_version": "2.4"}},
+            receive,
+            send,
+        )
+
+    detail = await client.get(
+        f"/api/v1/conversations/{conversation_id}", headers=headers
+    )
+    messages = detail.json()["messages"]
+    assert [message["sender"] for message in messages] == ["customer", "ai"]
+    assert messages[1]["content"] == "partial answer"
 
 
 async def test_chat_requires_auth_and_restricts_tenant(client):
