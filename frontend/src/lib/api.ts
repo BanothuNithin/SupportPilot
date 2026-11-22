@@ -159,6 +159,7 @@ export async function streamMessage(
   onToken: (text: string) => void,
   signal?: AbortSignal,
   onCitations?: (items: Citation[]) => void,
+  onEvent?: (event: string, data: Record<string, unknown>) => void,
 ) {
   const r = await authFetch(`/conversations/${conversationId}/messages`, {
     method: "POST",
@@ -178,10 +179,19 @@ export async function streamMessage(
     const { events, rest } = parseSse(buffer);
     buffer = rest;
     for (const e of events) {
-      const data = e.data as { text?: string; detail?: string; items?: Citation[] };
-      if (e.event === "token" && data.text) onToken(data.text);
-      if (e.event === "citations" && data.items) onCitations?.(data.items);
-      if (e.event === "error") throw new Error(data.detail ?? "The AI request failed.");
+      const data = e.data as Record<string, unknown>;
+      if (e.event === "token") {
+        if (typeof data.text === "string") onToken(data.text);
+        continue;
+      }
+      if (e.event === "citations") {
+        if (Array.isArray(data.items)) onCitations?.(data.items as Citation[]);
+        continue;
+      }
+      onEvent?.(e.event, data);
+      if (e.event === "error") {
+        throw new Error(typeof data.detail === "string" ? data.detail : "The AI request failed.");
+      }
     }
   }
 }

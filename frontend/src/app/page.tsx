@@ -14,6 +14,15 @@ import {
   streamMessage,
 } from "@/lib/api";
 
+const STEP_STATUS: Record<string, string> = {
+  triage: "Understanding your question...",
+  retrieve: "Searching the knowledge base...",
+  grade: "Checking the sources...",
+  decide: "Determining the next step...",
+  resolve: "Writing the answer...",
+  escalate: "Passing you to a human agent...",
+};
+
 export default function ChatPage() {
   const router = useRouter();
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -21,6 +30,8 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [statusLine, setStatusLine] = useState("");
+  const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -40,6 +51,7 @@ export default function ChatPage() {
     async (id: string) => {
       setActiveId(id);
       setError("");
+      setNotice("");
       try {
         setMessages(await getMessages(id));
       } catch (e) {
@@ -76,6 +88,7 @@ export default function ChatPage() {
       setActiveId(conv.id);
       setMessages([]);
       setError("");
+      setNotice("");
     } catch (e) {
       handleError(e);
     }
@@ -87,6 +100,8 @@ export default function ChatPage() {
     if (!text || !activeId || streaming || abortControllerRef.current) return;
     setInput("");
     setError("");
+    setNotice("");
+    setStatusLine("");
     setStreaming(true);
     const controller = new AbortController();
     const partialMessageId = `partial-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -100,6 +115,18 @@ export default function ChatPage() {
         controller.signal,
         (citations) =>
           setMessages((m) => m.map((x) => (x.id === "streaming" ? { ...x, citations } : x))),
+        (event, data) => {
+          if (event === "step" && typeof data.name === "string") {
+            setStatusLine(STEP_STATUS[data.name] ?? "");
+          } else if (event === "escalated") {
+            setNotice(
+              data.waiting === true
+                ? "A human agent is already handling this conversation and will reply here."
+                : "Passed to a human agent. A ticket was created.",
+            );
+            void listConversations().then(setConversations).catch(handleError);
+          }
+        },
       );
     } catch (err) {
       aborted = controller.signal.aborted || (err instanceof Error && err.name === "AbortError");
@@ -116,6 +143,7 @@ export default function ChatPage() {
     } finally {
       if (abortControllerRef.current === controller) abortControllerRef.current = null;
       setStreaming(false);
+      setStatusLine("");
       if (!aborted && activeId) setMessages(await getMessages(activeId).catch(() => []));
     }
   }
@@ -135,6 +163,9 @@ export default function ChatPage() {
         <a href="/documents" className="mx-3 mb-3 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-slate-800">
           Knowledge base
         </a>
+        <a href="/inbox" className="mx-3 mb-3 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-slate-800">
+          Escalations
+        </a>
         <div className="flex-1 space-y-1 overflow-y-auto px-3">
           {conversations.map((c) => (
             <button
@@ -142,7 +173,14 @@ export default function ChatPage() {
               onClick={() => openConversation(c.id)}
               className={`w-full truncate rounded-lg px-3 py-2 text-left text-sm ${c.id === activeId ? "bg-slate-800" : "hover:bg-slate-800/60"}`}
             >
-              Chat {new Date(c.created_at).toLocaleString()}
+              <span className="flex items-center justify-between gap-2">
+                <span className="truncate">Chat {new Date(c.created_at).toLocaleString()}</span>
+                {c.status === "escalated" && (
+                  <span className="shrink-0 rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-300">
+                    escalated
+                  </span>
+                )}
+              </span>
             </button>
           ))}
         </div>
@@ -152,6 +190,11 @@ export default function ChatPage() {
       </aside>
 
       <main className="flex flex-1 flex-col">
+        {notice && (
+          <div role="status" className="mx-6 mt-4 rounded-lg border border-amber-700 bg-amber-950/50 px-4 py-2 text-sm text-amber-200">
+            {notice}
+          </div>
+        )}
         <div className="flex-1 space-y-4 overflow-y-auto p-6">
           {!activeId && <p className="text-slate-400">Create a new chat to start.</p>}
           {messages.map((m) => {
@@ -187,6 +230,7 @@ export default function ChatPage() {
               </div>
             );
           })}
+          {streaming && statusLine && <p className="text-sm italic text-slate-400">{statusLine}</p>}
           <div ref={bottomRef} />
         </div>
         {error && <p className="px-6 pb-2 text-sm text-red-400">{error}</p>}
