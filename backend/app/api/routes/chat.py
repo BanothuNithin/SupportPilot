@@ -13,9 +13,11 @@ from starlette.types import Send
 from app.api.deps import get_current_user
 from app.api.tenant import get_owned
 from app.db.session import SessionLocal, get_db
-from llm import get_llm
-from llm.base import LLMError, LLMProvider
+from app.llm import get_llm
+from app.llm.base import LLMError, LLMProvider
 from app.models import Conversation, Message, User
+from app.rag import prompt as rag_prompt
+from app.rag.retrieve import retrieve
 from app.schemas.message import MessageIn
 
 router = APIRouter(prefix="/conversations", tags=["chat"])
@@ -75,11 +77,19 @@ async def send_message(
         {"role": "user" if m.sender == "customer" else "assistant", "content": m.content}
         for m in reversed(list(rows))
     ]
-    llm_messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+    hits = await retrieve(tenant_id, body.content)
+    cites = rag_prompt.citations(hits)
+    llm_messages = [{"role": "system", "content": rag_prompt.system_prompt(hits)}, *history]
 
     async def save_answer(answer: str) -> str:
         async with SessionLocal() as session:
-            msg = Message(tenant_id=tenant_id, conversation_id=conv_id, sender="ai", content=answer)
+            msg = Message(
+                tenant_id=tenant_id,
+                conversation_id=conv_id,
+                sender="ai",
+                content=answer,
+                citations=json.dumps(cites) if cites else None,
+            )
             session.add(msg)
             await session.commit()
             return str(msg.id)
@@ -87,6 +97,8 @@ async def send_message(
     async def event_stream():
         parts: list[str] = []
         saved = False
+        if cites:
+            yield sse("citations", {"items": cites})
 
         async def save_partial() -> None:
             nonlocal saved

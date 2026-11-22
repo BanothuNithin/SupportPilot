@@ -7,7 +7,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, Uuid
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -99,3 +99,5 @@ class Document(Base):
     storage_key: Mapped[str] = mapped_column(String(500))  # S3/MinIO key
     status: Mapped[str] = mapped_column(String(20), default="uploaded")  # uploaded | indexing | ready | failed
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    error: Mapped[str | None] = mapped_column(Text)

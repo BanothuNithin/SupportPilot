@@ -15,6 +15,14 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://localhost:11434/v1"
     llm_api_key: str = "ollama"
     llm_model: str = "llama3.2"
+    embed_provider: str = 'fake'
+    embed_base_url: str = 'http://localhost:11434/v1'
+    embed_api_key: str = 'ollama'
+    embed_model: str = 'nomic-embed-text'
+
+    rag_top_k: int = 4
+    rag_min_score: float = 0.35
+    max_upload_bytes: int = 5 * 1024 * 1024
 
 
 settings = Settings()

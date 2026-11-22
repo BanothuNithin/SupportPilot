@@ -1,7 +1,8 @@
+import json
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class ConversationCreate(BaseModel):
@@ -12,9 +13,15 @@ class MessageOut(BaseModel):
     id: uuid.UUID
     sender: str
     content: str
+    citations: list[dict] | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("citations", mode="before")
+    @classmethod
+    def _parse_citations(cls, v):
+        return json.loads(v) if isinstance(v, str) else v
 
 
 class ConversationOut(BaseModel):

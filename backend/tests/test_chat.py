@@ -5,9 +5,9 @@ import pytest
 from sqlalchemy import select
 from starlette.requests import ClientDisconnect
 
-from llm import get_llm
-from llm.base import LLMError
-from llm.fake import FakeProvider
+from app.llm import get_llm
+from app.llm.base import LLMError
+from app.llm.fake import FakeProvider
 from app.api.routes.chat import send_message
 from app.db.session import SessionLocal
 from app.main import app
