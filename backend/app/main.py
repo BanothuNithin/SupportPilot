@@ -7,7 +7,8 @@ from app.api.routes import auth, chat, conversations, customers
 from app.db.base import Base
 from app.db.session import engine
 import app.models
-from app.api.routes import documents  # noqa: F401  (register tables)
+from app.api.routes import documents
+from app.api.routes import tickets
 
 
 @asynccontextmanager
@@ -31,6 +32,7 @@ app.include_router(customers.router, prefix="/api/v1")
 app.include_router(conversations.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
+app.include_router(tickets.router, prefix="/api/v1")
 
 
 @app.get("/health")

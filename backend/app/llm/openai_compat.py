@@ -14,6 +14,31 @@ class OpenAICompatProvider:
         self.api_key = api_key
         self.model = model
 
+    async def complete(self, messages: list[dict], json_mode: bool = False) -> str:
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        payload: dict[str, object] = {"model": self.model, "messages": messages, "stream": False}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        timeout = httpx.Timeout(30.0, read=120.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+        except httpx.HTTPError as e:
+            raise LLMError(f"Cannot reach the model server at {self.base_url}: {e}") from e
+        if r.status_code != 200:
+            raise LLMError(f"Model server returned {r.status_code}: {r.text[:300]}")
+        try:
+            content = r.json()["choices"][0]["message"]["content"]
+        except (IndexError, KeyError, TypeError, ValueError) as e:
+            raise LLMError("Model server returned an invalid completion response") from e
+        if not isinstance(content, str):
+            raise LLMError("Model server returned a non-text completion")
+        return content
+
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
         headers = {"Authorization": f"Bearer {self.api_key}"}
         payload = {"model": self.model, "messages": messages, "stream": True}

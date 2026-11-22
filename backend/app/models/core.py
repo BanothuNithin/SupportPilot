@@ -7,7 +7,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text, Uuid
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -88,6 +88,10 @@ class Ticket(Base):
     status: Mapped[str] = mapped_column(String(20), default="open")
     assigned_to: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
     external_issue_url: Mapped[str | None] = mapped_column(String(500))  # GitHub issue via MCP (Week 5)
+    reason: Mapped[str | None] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, server_default=func.now()
+    )
 
 
 class Document(Base):

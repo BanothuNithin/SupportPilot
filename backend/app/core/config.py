@@ -24,5 +24,11 @@ class Settings(BaseSettings):
     rag_min_score: float = 0.35
     max_upload_bytes: int = 5 * 1024 * 1024
 
+    llm_small_model: str = ''
+    llm_fallback_model: str = ''
+    llm_fallback_base_url: str = ''
+    llm_fallback_api_key: str = ''
+    min_confidence: float = 0.5
+
 
 settings = Settings()

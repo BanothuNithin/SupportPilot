@@ -1,3 +1,4 @@
+import json
 import uuid
 from typing import AsyncIterator
 
@@ -11,7 +12,7 @@ from app.llm.fake import FakeProvider
 from app.api.routes.chat import send_message
 from app.db.session import SessionLocal
 from app.main import app
-from app.models import Conversation, User
+from app.models import Conversation, Ticket, User
 from app.schemas.message import MessageIn
 
 
@@ -46,7 +47,7 @@ async def test_chat_streams_and_saves_messages_in_order(client, monkeypatch):
     response = await client.post(
         f"/api/v1/conversations/{conversation_id}/messages",
         headers=headers,
-        json={"content": "Where is my order?"},
+        json={"content": "Hello"},
     )
 
     assert response.status_code == 200
@@ -57,19 +58,26 @@ async def test_chat_streams_and_saves_messages_in_order(client, monkeypatch):
     ]
     assert "token" in events, response.text
     assert events[-1] == "done"
-    assert set(events[:-1]) == {"token"}
+    assert "triage" in events
+    assert "step" in events
+    assert "escalated" not in events
 
     detail = await client.get(
         f"/api/v1/conversations/{conversation_id}", headers=headers
     )
     messages = detail.json()["messages"]
     assert [message["sender"] for message in messages] == ["customer", "ai"]
-    assert messages[0]["content"] == "Where is my order?"
-    assert messages[1]["content"] == "This is a fake answer to: Where is my order?"
+    assert messages[0]["content"] == "Hello"
+    assert messages[1]["content"] == "This is a fake answer to: Hello"
 
 
 async def test_chat_saves_partial_answer_when_client_disconnects(client):
     class OneTokenProvider:
+        async def complete(self, messages: list[dict], json_mode: bool = False) -> str:
+            return json.dumps(
+                {"intent": "chitchat", "priority": "medium", "wants_human": False}
+            )
+
         async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
             yield "partial answer "
 
@@ -84,7 +92,7 @@ async def test_chat_saves_partial_answer_when_client_disconnects(client):
 
         response = await send_message(
             uuid.UUID(conversation_id),
-            MessageIn(content="Need help"),
+            MessageIn(content="Hello"),
             user=user,
             db=db,
             llm=OneTokenProvider(),
@@ -94,7 +102,11 @@ async def test_chat_saves_partial_answer_when_client_disconnects(client):
         return {"type": "http.disconnect"}
 
     async def send(message):
-        if message["type"] == "http.response.body" and message.get("more_body"):
+        if (
+            message["type"] == "http.response.body"
+            and message.get("more_body")
+            and b"event: token" in message.get("body", b"")
+        ):
             raise OSError("client disconnected")
 
     with pytest.raises(ClientDisconnect):
@@ -141,6 +153,11 @@ async def test_model_failure_sends_error_without_saving_ai_message(
     client, monkeypatch
 ):
     class FailingProvider:
+        async def complete(self, messages: list[dict], json_mode: bool = False) -> str:
+            return json.dumps(
+                {"intent": "chitchat", "priority": "medium", "wants_human": False}
+            )
+
         def stream(self, messages: list[dict]) -> AsyncIterator[str]:
             async def fail() -> AsyncIterator[str]:
                 if not messages:
@@ -156,7 +173,7 @@ async def test_model_failure_sends_error_without_saving_ai_message(
     response = await client.post(
         f"/api/v1/conversations/{conversation_id}/messages",
         headers=headers,
-        json={"content": "Need help"},
+        json={"content": "Hello"},
     )
 
     events = [
@@ -165,9 +182,70 @@ async def test_model_failure_sends_error_without_saving_ai_message(
         if line.startswith("event: ")
     ]
     assert response.status_code == 200
-    assert events == ["error"]
+    assert events[-1] == "error"
+    assert "triage" in events
+    assert "step" in events
 
     detail = await client.get(
         f"/api/v1/conversations/{conversation_id}", headers=headers
     )
     assert [message["sender"] for message in detail.json()["messages"]] == ["customer"]
+
+
+async def test_human_request_escalates_and_creates_ticket(client, monkeypatch):
+    headers = await register(client, "Acme", "owner@acme.com")
+    conversation_id = await create_conversation(client, headers)
+    monkeypatch.setitem(app.dependency_overrides, get_llm, FakeProvider)
+
+    response = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages",
+        headers=headers,
+        json={"content": "Please connect me with a human agent."},
+    )
+
+    events = [
+        line.removeprefix("event: ")
+        for line in response.text.splitlines()
+        if line.startswith("event: ")
+    ]
+    assert response.status_code == 200
+    assert "escalated" in events
+    assert events[-1] == "done"
+
+    detail = await client.get(
+        f"/api/v1/conversations/{conversation_id}", headers=headers
+    )
+    assert detail.json()["status"] == "escalated"
+    async with SessionLocal() as db:
+        ticket = await db.scalar(
+            select(Ticket).where(Ticket.conversation_id == uuid.UUID(conversation_id))
+        )
+    assert ticket is not None
+    assert ticket.reason == "customer_requested_human"
+
+
+async def test_question_without_retrieval_escalates_without_citations(client, monkeypatch):
+    headers = await register(client, "Acme", "owner@acme.com")
+    conversation_id = await create_conversation(client, headers)
+    monkeypatch.setitem(app.dependency_overrides, get_llm, FakeProvider)
+
+    response = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages",
+        headers=headers,
+        json={"content": "Where is my order?"},
+    )
+
+    events = [
+        line.removeprefix("event: ")
+        for line in response.text.splitlines()
+        if line.startswith("event: ")
+    ]
+    assert response.status_code == 200
+    assert "citations" not in events
+    assert "escalated" in events
+
+    detail = await client.get(
+        f"/api/v1/conversations/{conversation_id}", headers=headers
+    )
+    assert detail.json()["status"] == "escalated"
+    assert detail.json()["messages"][-1]["sender"] == "ai"
