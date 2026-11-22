@@ -4,11 +4,12 @@ Solid boxes are built. Dashed boxes are planned (week in brackets).
 
 ```mermaid
 flowchart TD
-    UI["Next.js chat widget and dashboard (Week 2)"]:::planned
+    UI["Next.js chat and knowledge-base UI"]:::done
     API["FastAPI: auth, RBAC, tenant scoping"]:::done
     AG["LangGraph agents: Triage, Resolver, Action (Week 4)"]:::planned
-    RAG["RAG: Qdrant + citations (Week 3)"]:::planned
-    LLM["Model router: Claude / GPT / Ollama (Week 4)"]:::planned
+    RAG["RAG retrieval and prompt assembly"]:::done
+    QD[("Qdrant: chunks, tenant-filtered search")]:::done
+    LLM["OpenAI-compatible LLM provider: Ollama"]:::done
     MCP["MCP tools: GitHub, Slack, browser (Week 5)"]:::planned
     PG[("PostgreSQL")]:::done
     RD[("Redis: refresh tokens, rate limits")]:::done
@@ -16,13 +17,14 @@ flowchart TD
     OBS["Langfuse + RAGAS (Week 7)"]:::planned
 
     UI --> API
-    API --> AG
-    AG --> RAG
-    AG --> LLM
-    AG --> MCP
+    API --> RAG
+    RAG --> QD
+    API --> LLM
+    API -.-> AG
+    AG -.-> MCP
     API --> PG
     API --> RD
-    RAG --> S3
+    RAG -.-> S3
     AG -.-> OBS
 
     classDef done fill:#14532d,stroke:#4ade80,color:#ffffff;
@@ -37,6 +39,66 @@ flowchart TD
 5. The Action agent calls MCP tools. Sensitive actions wait for human approval.
 6. Low confidence escalates the conversation to a human agent.
 7. Every step is traced for quality, latency and cost.
+
+## Document ingestion (built)
+```mermaid
+sequenceDiagram
+    participant U as Owner or Admin
+    participant A as FastAPI
+    participant D as PostgreSQL
+    participant B as BackgroundTask
+    participant X as Extractor
+    participant C as Chunker
+    participant E as Embedder
+    participant Q as Qdrant
+    U->>A: POST /api/v1/documents (file)
+    A->>D: Create document with status indexing
+    A-->>U: 202 Accepted
+    A-)B: Schedule index_document
+    B->>X: Extract text (pypdf for PDF)
+    X-->>B: Text
+    B->>C: Split paragraphs (800 chars, 100 overlap)
+    C-->>B: Chunks
+    B->>E: Embed chunks
+    E-->>B: Vectors
+    B->>Q: Upsert chunks with tenant_id payload
+    Q-->>B: Stored
+    alt Indexing succeeds
+        B->>D: Set status ready and chunk_count
+    else Indexing fails
+        B->>D: Set status failed and error
+    end
+```
+
+## Answering a question (built)
+```mermaid
+sequenceDiagram
+    participant U as Chat UI
+    participant A as FastAPI
+    participant D as PostgreSQL
+    participant E as Embedder
+    participant Q as Qdrant
+    participant L as LLM provider
+    U->>A: POST /api/v1/conversations/{id}/messages
+    A->>D: Save customer message
+    A->>E: Embed question
+    E-->>A: Query vector
+    A->>Q: Search with mandatory tenant_id filter (top_k 4, minimum score 0.35)
+    alt Retrieval succeeds
+        Q-->>A: Matching chunks
+    else Retrieval fails
+        A->>A: Log error and continue without context
+    end
+    A->>A: Build prompt from retrieved context
+    A-->>U: SSE citations event (when citations exist)
+    A->>L: Stream answer from context-based prompt
+    loop For each answer token
+        L-->>A: Token
+        A-->>U: SSE token event
+    end
+    A->>D: Save AI message and citations as JSON
+    A-->>U: SSE done event
+```
 
 ## Auth flow (built)
 ```mermaid
@@ -110,6 +172,8 @@ erDiagram
         uuid tenant_id FK
         string filename
         string status
+        int chunk_count
+        text error
     }
 ```
 

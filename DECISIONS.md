@@ -64,3 +64,43 @@ Each entry: what I chose, what I rejected, and what it costs.
 - **Chose:** all concurrent API calls that encounter an expired access token await the same refresh promise.
 - **Why:** refresh tokens rotate and are single-use; parallel refreshes with the same token could invalidate the session.
 - **Cost:** callers wait for the refresh already in progress instead of starting their own refresh request.
+
+## 16. Paragraph-aware chunks with overlap
+- **Chose:** split extracted text into paragraph-aware chunks of 800 characters with 100 characters of overlap.
+- **Rejected:** non-overlapping chunks that can separate a relevant passage at a boundary.
+- **Cost:** overlapping text is embedded and stored more than once.
+
+## 17. One Qdrant collection with tenant filtering
+- **Chose:** store all tenants' chunks in one `chunks` collection and include a mandatory `tenant_id` filter on every search.
+- **Rejected:** a separate collection per tenant.
+- **Cost:** every search path must preserve the tenant filter; omitting it risks cross-tenant retrieval.
+
+## 18. Initial retrieval score threshold
+- **Chose:** use a minimum similarity score of 0.35 for retrieved chunks.
+- **Rejected:** returning results below this initial relevance threshold.
+- **Cost:** the threshold is not tuned; evaluation is TBD (Week 7 evals).
+
+## 19. Citations and document-grounded refusal
+- **Chose:** instruct the model to answer from retrieved context, cite sources as `[1]`, `[2]`, and say it could not find the answer in company documents when context is insufficient, while offering a human agent.
+- **Rejected:** answers without source attribution or a clear response when the documents do not contain the answer.
+- **Cost:** the model can still cite a document next to a refusal; structured output is planned for Week 4.
+
+## 20. Treat uploaded documents as untrusted data
+- **Chose:** label retrieved context as reference data and instruct the model never to follow instructions inside it.
+- **Rejected:** treating text from an uploaded document as system instructions.
+- **Cost:** this is a prompt-level safeguard; uploaded text remains part of the model's context.
+
+## 21. Continue chat when retrieval fails
+- **Chose:** log retrieval failures and continue the chat without knowledge-base context.
+- **Rejected:** failing the whole chat request when embeddings or vector search are unavailable.
+- **Cost:** without retrieval, the model has no company-document context for its answer.
+
+## 22. FastAPI BackgroundTasks before a job queue
+- **Chose:** run document indexing as a FastAPI BackgroundTask for now.
+- **Rejected:** adding a separate job queue at this stage.
+- **Cost:** a server restart during indexing can leave a document stuck in `indexing`; a job queue is planned for Week 6.
+
+## 23. Hermetic tests with fake embeddings
+- **Chose:** use a deterministic fake hashing embedder and force `LLM_PROVIDER=fake`, `EMBED_PROVIDER=fake`, and `QDRANT_URL=:memory:` in tests.
+- **Rejected:** tests that depend on `.env`, Ollama, or external model services.
+- **Cost:** the fake embedder makes tests repeatable but does not measure production embedding quality; evaluation is TBD (Week 7 evals).
