@@ -98,6 +98,8 @@ export default function ChatPage() {
       await streamMessage(activeId, text, (token) =>
         setMessages((m) => m.map((x) => (x.id === "streaming" ? { ...x, content: x.content + token } : x))),
         controller.signal,
+        (citations) =>
+          setMessages((m) => m.map((x) => (x.id === "streaming" ? { ...x, citations } : x))),
       );
     } catch (err) {
       aborted = controller.signal.aborted || (err instanceof Error && err.name === "AbortError");
@@ -130,6 +132,9 @@ export default function ChatPage() {
         <button onClick={newChat} className="mx-3 mb-3 rounded-lg bg-violet-600 py-2 text-sm font-semibold hover:bg-violet-500">
           + New chat
         </button>
+        <a href="/documents" className="mx-3 mb-3 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-slate-800">
+          Knowledge base
+        </a>
         <div className="flex-1 space-y-1 overflow-y-auto px-3">
           {conversations.map((c) => (
             <button
@@ -149,17 +154,39 @@ export default function ChatPage() {
       <main className="flex flex-1 flex-col">
         <div className="flex-1 space-y-4 overflow-y-auto p-6">
           {!activeId && <p className="text-slate-400">Create a new chat to start.</p>}
-          {messages.map((m) => (
-            <div key={m.id} className={`flex ${m.sender === "customer" ? "justify-end" : "justify-start"}`}>
-              <div
-                className={`max-w-xl whitespace-pre-wrap rounded-2xl px-4 py-2 ${
-                  m.sender === "customer" ? "bg-violet-600 text-white" : "bg-slate-800 text-slate-100"
-                }`}
-              >
-                {m.content || (streaming && m.id === "streaming" ? "..." : "")}
+          {messages.map((m) => {
+            const referencedNumbers = new Set(
+              Array.from(m.content.matchAll(/\[(\d+)\]/g), ([, number]) => Number(number)),
+            );
+            const citations = m.citations?.filter((citation) => referencedNumbers.has(citation.n)) ?? [];
+
+            return (
+              <div key={m.id} className={`flex ${m.sender === "customer" ? "justify-end" : "justify-start"}`}>
+                <div className={m.sender === "customer" ? "max-w-xl" : "flex max-w-xl flex-col items-start"}>
+                  <div
+                    className={`whitespace-pre-wrap rounded-2xl px-4 py-2 ${
+                      m.sender === "customer" ? "bg-violet-600 text-white" : "bg-slate-800 text-slate-100"
+                    }`}
+                  >
+                    {m.content || (streaming && m.id === "streaming" ? "..." : "")}
+                  </div>
+                  {m.sender === "ai" && citations.length > 0 ? (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {citations.map((citation) => (
+                        <span
+                          key={`${citation.document_id}-${citation.chunk_index}-${citation.n}`}
+                          title={citation.snippet}
+                          className="rounded-full border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-300"
+                        >
+                          [{citation.n}] {citation.filename}, section {citation.chunk_index + 1}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
           <div ref={bottomRef} />
         </div>
         {error && <p className="px-6 pb-2 text-sm text-red-400">{error}</p>}

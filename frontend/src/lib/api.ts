@@ -5,7 +5,21 @@ const KEY = "supportpilot.tokens";
 
 type Tokens = { access_token: string; refresh_token: string };
 export type Conversation = { id: string; customer_id: string; status: string; created_at: string };
-export type Message = { id: string; sender: "customer" | "ai" | "human"; content: string; created_at?: string };
+export type Citation = {
+  n: number;
+  document_id: string;
+  filename: string;
+  chunk_index: number;
+  score: number;
+  snippet: string;
+};
+export type Message = {
+  id: string;
+  sender: "customer" | "ai" | "human";
+  content: string;
+  created_at?: string;
+  citations?: Citation[] | null;
+};
 
 export class AuthError extends Error {}
 
@@ -83,7 +97,7 @@ function refreshTokens(): Promise<boolean> {
 }
 
 // fetch with the access token attached; on 401 refresh once and retry
-async function authFetch(path: string, init: RequestInit = {}): Promise<Response> {
+export async function authFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const send = () => {
     const t = getTokens();
     if (!t) throw new AuthError("Not logged in");
@@ -144,6 +158,7 @@ export async function streamMessage(
   content: string,
   onToken: (text: string) => void,
   signal?: AbortSignal,
+  onCitations?: (items: Citation[]) => void,
 ) {
   const r = await authFetch(`/conversations/${conversationId}/messages`, {
     method: "POST",
@@ -163,8 +178,9 @@ export async function streamMessage(
     const { events, rest } = parseSse(buffer);
     buffer = rest;
     for (const e of events) {
-      const data = e.data as { text?: string; detail?: string };
+      const data = e.data as { text?: string; detail?: string; items?: Citation[] };
       if (e.event === "token" && data.text) onToken(data.text);
+      if (e.event === "citations" && data.items) onCitations?.(data.items);
       if (e.event === "error") throw new Error(data.detail ?? "The AI request failed.");
     }
   }
