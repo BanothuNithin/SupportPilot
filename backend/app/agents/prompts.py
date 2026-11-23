@@ -1,13 +1,3 @@
-TRIAGE = (
-    "TASK: triage\n"
-    "You classify a message sent to a customer support chat. Reply with JSON only, in exactly this shape:\n"
-    '{"intent": "question" | "complaint" | "bug_report" | "chitchat" | "other", '
-    '"priority": "low" | "medium" | "high", "wants_human": true | false}\n'
-    "chitchat means greetings, thanks or small talk. bug_report means something is broken. "
-    "priority is high for outages, data loss, security problems, payment failures or an angry customer. "
-    "wants_human is true only if the customer asks for a person."
-)
-
 GRADE = (
     "TASK: grade\n"
     "You check whether the CONTEXT contains the information needed to answer the customer's QUESTION. "

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import re
 from typing import AsyncIterator
 
 
@@ -10,18 +9,13 @@ class FakeProvider:
     def __init__(self, delay: float = 0.0):
         self.delay = delay
 
-    async def complete(self, messages: list[dict], json_mode: bool = False) -> str:
+    async def complete(
+        self,
+        messages: list[dict],
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+    ) -> str:
         system = messages[0]["content"] if messages else ""
-        user = messages[-1]["content"] if messages else ""
-        if "TASK: triage" in system:
-            lowered = user.lower()
-            wants_human = bool(
-                re.search(r"\b(human|real person|representative|live agent|support agent)\b", lowered)
-            )
-            intent = "chitchat" if re.match(r"^(hi|hello|hey|thanks|thank you)\b", lowered.strip()) else "question"
-            return json.dumps(
-                {"intent": intent, "priority": "medium", "wants_human": wants_human}
-            )
         if "TASK: grade" in system:
             return json.dumps({"can_answer": True, "confidence": 1.0})
         raise ValueError("Fake provider received an unsupported completion prompt")

@@ -7,20 +7,14 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
 from app.agents import prompts
+from app.agents.query import build_search_query
+from app.agents.rules import HUMAN_REQUEST, fast_path, rule_triage
 from app.agents.state import Grade, State, Triage
 from app.core.config import settings
 from app.rag import prompt as rag_prompt
 from app.rag.retrieve import retrieve
 
 log = logging.getLogger(__name__)
-
-# Deterministic safety net: a customer asking for a person is NEVER left to a small model's judgement.
-HUMAN_REQUEST = re.compile(
-    r"\b(human|real person|representative|live agent|support agent|"
-    r"(talk|speak) (to|with) (a |an )?(person|someone|agent))\b",
-    re.IGNORECASE,
-)
-
 
 def _parse_json(text: str) -> dict:
     try:
@@ -33,21 +27,20 @@ def _parse_json(text: str) -> dict:
 
 
 async def triage_node(state: State, config: RunnableConfig) -> dict:
-    llm = config["configurable"]["llm"]
     question = state["question"]
-    try:
-        raw = await llm.complete([{"role": "system", "content": prompts.TRIAGE}, {"role": "user", "content": question}], json_mode=True)
-        triage = Triage.model_validate(_parse_json(raw))
-    except Exception:
-        log.warning("Triage failed; using defaults", exc_info=True)  # degrade gracefully, never block the chat
-        triage = Triage()
-    if HUMAN_REQUEST.search(question):
-        triage.wants_human = True
-    return {"triage": triage}
+    result: dict[str, object] = {"triage": rule_triage(question)}
+    path = fast_path(question)
+    if path is not None:
+        result["outcome"], result["reason"] = path
+    return result
 
 
 async def retrieve_node(state: State, config: RunnableConfig) -> dict:
-    return {"hits": await retrieve(state["tenant_id"], state["question"])}
+    query = build_search_query(state["question"], state.get("history", []))
+    return {
+        "hits": await retrieve(state["tenant_id"], query),
+        "search_query": query,
+    }
 
 
 async def grade_node(state: State, config: RunnableConfig) -> dict:
@@ -56,9 +49,14 @@ async def grade_node(state: State, config: RunnableConfig) -> dict:
     if not hits:
         return {"grade": Grade(can_answer=False, confidence=0.0)}  # nothing retrieved: no LLM call needed
     context = "\n\n".join(f"[{i}] (source: {h.filename})\n{h.text}" for i, h in enumerate(hits, start=1))
-    user = f"QUESTION: {state['question']}\n\nCONTEXT:\n{context}"
+    question = state.get("search_query") or state["question"]
+    user = f"QUESTION: {question}\n\nCONTEXT:\n{context}"
     try:
-        raw = await llm.complete([{"role": "system", "content": prompts.GRADE}, {"role": "user", "content": user}], json_mode=True)
+        raw = await llm.complete(
+            [{"role": "system", "content": prompts.GRADE}, {"role": "user", "content": user}],
+            json_mode=True,
+            max_tokens=80,
+        )
         grade = Grade.model_validate(_parse_json(raw))
     except Exception:
         log.warning("Grading failed; falling back to retrieval score", exc_info=True)

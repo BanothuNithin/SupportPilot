@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from time import perf_counter
 import uuid
 from collections.abc import AsyncGenerator
 
@@ -11,9 +12,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import Send
 
+from app.agents import prompts
 from app.agents.graph import graph
 from app.api.deps import get_current_user
 from app.api.tenant import get_owned
+from app.core.config import settings
 from app.db.session import SessionLocal, get_db
 from app.llm import get_llm
 from app.llm.base import LLMError, LLMProvider
@@ -23,7 +26,6 @@ from app.schemas.message import MessageIn
 router = APIRouter(prefix="/conversations", tags=["chat"])
 log = logging.getLogger(__name__)
 
-HISTORY_LIMIT = 20
 SAVE_TIMEOUT_SECONDS = 5
 
 
@@ -48,6 +50,25 @@ class DisconnectAwareStreamingResponse(StreamingResponse):
 def sse(event: str, data: dict) -> str:
     """Format one Server-Sent Event."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def decision_payload(result: dict) -> dict:
+    grade = result.get("grade")
+    return {
+        "outcome": result.get("outcome"),
+        "reason": result.get("reason"),
+        "can_answer": grade.can_answer if grade is not None else None,
+        "confidence": grade.confidence if grade is not None else None,
+        "top_scores": [round(hit.score, 3) for hit in result.get("hits", [])],
+        "search_query": result.get("search_query"),
+    }
+
+
+def log_decision(decision: dict) -> None:
+    log.info(
+        "decision %s",
+        {key: value for key, value in decision.items() if key != "search_query"},
+    )
 
 
 async def persist_reply(
@@ -126,18 +147,26 @@ async def send_message(
         select(Message)
         .where(Message.conversation_id == conv_id, Message.tenant_id == tenant_id)
         .order_by(Message.created_at.desc())
-        .limit(HISTORY_LIMIT)
+        .limit(settings.history_limit * 2)
     )
+    handoff_messages = set(prompts.HANDOFF.values())
     history = [
         {"role": "user" if m.sender == "customer" else "assistant", "content": m.content}
         for m in reversed(list(rows))
+        if not (m.sender == "ai" and m.content in handoff_messages)
     ]
+    history = history[-settings.history_limit :]
     initial = {"question": body.content, "history": history, "tenant_id": tenant_id}
 
     async def event_stream():
+        started_at = perf_counter()
+        last_update_at = started_at
         parts: list[str] = []
         result: dict = {}
         cites: list[dict] = []
+        stage_ms: dict[str, int] = {}
+        ttft_ms: int | None = None
+        decision_emitted = False
         saved = failed = False
         cancel = asyncio.Event()
         try:
@@ -148,6 +177,13 @@ async def send_message(
             ):
                 if mode == "custom":
                     if chunk["type"] == "token":
+                        if ttft_ms is None:
+                            ttft_ms = int((perf_counter() - started_at) * 1000)
+                            log.info(
+                                "first token after %s ms, outcome=%s",
+                                ttft_ms,
+                                result.get("outcome"),
+                            )
                         parts.append(chunk["text"])
                         yield sse("token", {"text": chunk["text"]})
                     elif chunk["type"] == "citations":
@@ -156,10 +192,23 @@ async def send_message(
                     continue
                 for node, update in chunk.items():
                     result.update(update or {})
+                    update_at = perf_counter()
+                    stage_ms[node] = max(0, int((update_at - last_update_at) * 1000))
+                    last_update_at = update_at
                     yield sse("step", {"name": node})
                     if node == "triage":
                         triage = result["triage"]
                         yield sse("triage", {"intent": triage.intent, "priority": triage.priority})
+                        if "outcome" in (update or {}) and not decision_emitted:
+                            decision = decision_payload(result)
+                            log_decision(decision)
+                            decision_emitted = True
+                            yield sse("decision", decision)
+                    elif node == "decide" and not decision_emitted:
+                        decision = decision_payload(result)
+                        log_decision(decision)
+                        decision_emitted = True
+                        yield sse("decision", decision)
 
             answer = "".join(parts).strip()
             if not answer:
@@ -180,7 +229,10 @@ async def send_message(
             saved = True
             if result.get("outcome") == "escalate":
                 yield sse("escalated", {"ticket_id": ticket_id, "reason": result.get("reason")})
-            yield sse("done", {"message_id": message_id})
+            yield sse(
+                "done",
+                {"message_id": message_id, "ttft_ms": ttft_ms, "stage_ms": stage_ms},
+            )
         except LLMError as e:
             failed = True
             yield sse("error", {"detail": str(e)})

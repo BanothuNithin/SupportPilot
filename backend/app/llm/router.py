@@ -1,7 +1,7 @@
 """Model router: picks the model per task and falls back when the primary one fails.
 
 - stream(): the main model writes customer-facing answers.
-- complete(): the small model does short structured tasks (triage, grading).
+- complete(): the small model does short structured grading.
 - If a call fails BEFORE producing output, the fallback model is tried. Once tokens have been
   sent to the customer we cannot silently switch models, so the error is raised instead.
 """
@@ -35,11 +35,20 @@ class ModelRouter:
                 async for token in tokens:
                     yield token
 
-    async def complete(self, messages: list[dict], json_mode: bool = False) -> str:
+    async def complete(
+        self,
+        messages: list[dict],
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+    ) -> str:
         try:
-            return await self.small.complete(messages, json_mode=json_mode)
+            return await self.small.complete(
+                messages, json_mode=json_mode, max_tokens=max_tokens
+            )
         except LLMError as e:
             if self.fallback is None:
                 raise
             log.warning("Small model failed (%s); using the fallback model", e)
-            return await self.fallback.complete(messages, json_mode=json_mode)
+            return await self.fallback.complete(
+                messages, json_mode=json_mode, max_tokens=max_tokens
+            )

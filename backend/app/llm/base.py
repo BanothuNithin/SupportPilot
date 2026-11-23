@@ -10,6 +10,11 @@ class LLMProvider(Protocol):
         """Yield the answer as text chunks. `messages` use roles system/user/assistant."""
         ...
 
-    async def complete(self, messages: list[dict], json_mode: bool = False) -> str:
-        """Return one complete response, optionally requesting a JSON object."""
+    async def complete(
+        self,
+        messages: list[dict],
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Return one complete response, optionally constrained to JSON and a token limit."""
         ...

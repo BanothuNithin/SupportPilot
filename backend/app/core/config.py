@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     rag_top_k: int = 4
     rag_min_score: float = 0.35
     max_upload_bytes: int = 5 * 1024 * 1024
+    history_limit: int = 6
 
     llm_small_model: str = ''
     llm_fallback_model: str = ''

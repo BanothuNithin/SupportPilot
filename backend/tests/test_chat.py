@@ -1,18 +1,22 @@
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator
 
 import pytest
 from sqlalchemy import select
 from starlette.requests import ClientDisconnect
 
+from app.agents import nodes
+from app.core.config import settings
 from app.llm import get_llm
 from app.llm.base import LLMError
 from app.llm.fake import FakeProvider
 from app.api.routes.chat import send_message
 from app.db.session import SessionLocal
 from app.main import app
-from app.models import Conversation, Ticket, User
+from app.models import Conversation, Message, Ticket, User
+from app.rag.store import Hit
 from app.schemas.message import MessageIn
 
 
@@ -71,12 +75,80 @@ async def test_chat_streams_and_saves_messages_in_order(client, monkeypatch):
     assert messages[1]["content"] == "This is a fake answer to: Hello"
 
 
+async def test_chat_only_sends_latest_six_messages_to_model(client, monkeypatch):
+    headers = await register(client, "Acme", "owner@acme.com")
+    conversation_id = await create_conversation(client, headers)
+    monkeypatch.setattr(settings, "history_limit", 6, raising=False)
+
+    async def retrieve(tenant_id, question):
+        return [Hit("doc", "help.txt", 0, "Address update instructions.", 0.9)]
+
+    monkeypatch.setattr(nodes, "retrieve", retrieve)
+
+    async with SessionLocal() as db:
+        conversation = await db.get(Conversation, uuid.UUID(conversation_id))
+        assert conversation is not None
+        start = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.add_all(
+            [
+                Message(
+                    tenant_id=conversation.tenant_id,
+                    conversation_id=conversation.id,
+                    sender="customer",
+                    content=f"stored-{index}",
+                    created_at=start + timedelta(seconds=index),
+                )
+                for index in range(9)
+            ]
+        )
+        await db.commit()
+
+    class RecordingProvider:
+        def __init__(self):
+            self.stream_messages = []
+
+        async def complete(
+            self,
+            messages: list[dict],
+            json_mode: bool = False,
+            max_tokens: int | None = None,
+        ) -> str:
+            return json.dumps({"can_answer": True, "confidence": 0.9})
+
+        async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
+            self.stream_messages = messages
+            yield "Answer."
+
+    provider = RecordingProvider()
+    monkeypatch.setitem(app.dependency_overrides, get_llm, lambda: provider)
+
+    response = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages",
+        headers=headers,
+        json={"content": "How do I update my address?"},
+    )
+
+    assert response.status_code == 200
+    history = provider.stream_messages[1:]
+    assert [message["content"] for message in history] == [
+        "stored-4",
+        "stored-5",
+        "stored-6",
+        "stored-7",
+        "stored-8",
+        "How do I update my address?",
+    ]
+
+
 async def test_chat_saves_partial_answer_when_client_disconnects(client):
     class OneTokenProvider:
-        async def complete(self, messages: list[dict], json_mode: bool = False) -> str:
-            return json.dumps(
-                {"intent": "chitchat", "priority": "medium", "wants_human": False}
-            )
+        async def complete(
+            self,
+            messages: list[dict],
+            json_mode: bool = False,
+            max_tokens: int | None = None,
+        ) -> str:
+            raise AssertionError("Hello fast path must not call complete")
 
         async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
             yield "partial answer "
@@ -153,10 +225,13 @@ async def test_model_failure_sends_error_without_saving_ai_message(
     client, monkeypatch
 ):
     class FailingProvider:
-        async def complete(self, messages: list[dict], json_mode: bool = False) -> str:
-            return json.dumps(
-                {"intent": "chitchat", "priority": "medium", "wants_human": False}
-            )
+        async def complete(
+            self,
+            messages: list[dict],
+            json_mode: bool = False,
+            max_tokens: int | None = None,
+        ) -> str:
+            raise AssertionError("Hello fast path must not call complete")
 
         def stream(self, messages: list[dict]) -> AsyncIterator[str]:
             async def fail() -> AsyncIterator[str]:

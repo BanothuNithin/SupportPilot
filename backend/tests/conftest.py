@@ -1,6 +1,11 @@
 import os
 
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test.db"
+os.environ["RAG_MIN_SCORE"] = "0.35"
+os.environ["MIN_CONFIDENCE"] = "0.5"
+os.environ["RAG_TOP_K"] = "4"
+os.environ["LLM_SMALL_MODEL"] = ""
+os.environ["LLM_FALLBACK_MODEL"] = ""
 
 import fakeredis.aioredis  # noqa: E402
 import app.core.redis as redis_mod  # noqa: E402

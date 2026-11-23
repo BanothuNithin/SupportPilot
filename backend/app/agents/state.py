@@ -31,6 +31,7 @@ class State(TypedDict, total=False):
     question: str
     history: list[dict]
     tenant_id: object  # uuid.UUID
+    search_query: str
     # produced by nodes
     triage: Triage
     hits: list

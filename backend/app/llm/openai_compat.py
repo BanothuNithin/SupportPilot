@@ -9,19 +9,40 @@ from .base import LLMError
 class OpenAICompatProvider:
     """Works with any server that speaks the OpenAI chat API: Ollama (/v1), OpenAI, vLLM, LM Studio..."""
 
-    def __init__(self, base_url: str, api_key: str, model: str):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.transport = transport
 
-    async def complete(self, messages: list[dict], json_mode: bool = False) -> str:
+    async def complete(
+        self,
+        messages: list[dict],
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+    ) -> str:
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        payload: dict[str, object] = {"model": self.model, "messages": messages, "stream": False}
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "temperature": 0,
+        }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         timeout = httpx.Timeout(30.0, read=120.0)
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout, transport=self.transport
+            ) as client:
                 r = await client.post(
                     f"{self.base_url}/chat/completions",
                     headers=headers,
@@ -44,7 +65,9 @@ class OpenAICompatProvider:
         payload = {"model": self.model, "messages": messages, "stream": True}
         timeout = httpx.Timeout(30.0, read=120.0)
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout, transport=self.transport
+            ) as client:
                 async with client.stream("POST", f"{self.base_url}/chat/completions", headers=headers, json=payload) as r:
                     if r.status_code != 200:
                         body = (await r.aread()).decode(errors="replace")[:300]
