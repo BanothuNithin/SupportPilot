@@ -81,9 +81,9 @@ Each entry: what I chose, what I rejected, and what it costs.
 - **Cost:** the threshold is not tuned; evaluation is TBD (Week 7 evals).
 
 ## 19. Citations and document-grounded refusal
-- **Chose:** instruct the model to answer from retrieved context, cite sources as `[1]`, `[2]`, and say it could not find the answer in company documents when context is insufficient, while offering a human agent.
-- **Rejected:** answers without source attribution or a clear response when the documents do not contain the answer.
-- **Cost:** the model can still cite a document next to a refusal; structured output is planned for Week 4.
+- **Chose:** grade retrieved context before generation, answer only when it is judged answerable and confident enough, and include citations only on the grounded resolution path. If context is missing or insufficient, escalate with a clear handoff response.
+- **Rejected:** generating a policy answer from model knowledge when the tenant's documents do not support it.
+- **Cost:** the grader is still a model judgment and can be wrong. If grading itself fails, the current fallback uses the top retrieval score; prompt instructions also cannot guarantee perfect adherence to context.
 
 ## 20. Treat uploaded documents as untrusted data
 - **Chose:** label retrieved context as reference data and instruct the model never to follow instructions inside it.
@@ -104,3 +104,34 @@ Each entry: what I chose, what I rejected, and what it costs.
 - **Chose:** use a deterministic fake hashing embedder and force `LLM_PROVIDER=fake`, `EMBED_PROVIDER=fake`, and `QDRANT_URL=:memory:` in tests.
 - **Rejected:** tests that depend on `.env`, Ollama, or external model services.
 - **Cost:** the fake embedder makes tests repeatable but does not measure production embedding quality; evaluation is TBD (Week 7 evals).
+
+## 24. Deterministic triage and fast paths
+- **Chose:** classify intent and priority with local rules, and use the human-request regex as the sole signal for an explicit request to speak to a person. Greetings and supported assistant-meta questions take a chitchat fast path.
+- **Rejected:** an LLM triage call before every message; small-model false positives previously caused greetings to be escalated.
+- **Cost:** rules are less flexible than a model and may need tuning as customer phrasing changes. A fast path intentionally bypasses document retrieval and grading.
+
+## 25. Sequential LangGraph routing
+- **Chose:** route from triage first; direct human requests to escalation, chitchat to resolution, and other questions through retrieval, grading, and a final decision.
+- **Rejected:** running retrieval alongside triage for every message.
+- **Why:** unnecessary retrieval and model work is avoided for fast paths, and only the grader and answer generation use the LLM on a normal grounded request.
+- **Cost:** retrieval and grading are sequential for normal questions. A no-hit result is treated as unanswerable rather than asking the model to answer from general knowledge.
+
+## 26. Search-only query cleanup and follow-up expansion
+- **Chose:** strip common instruction filler and expand a recognized follow-up with the most recent earlier user question that is not itself a follow-up. The original conversation and customer wording are still given to the answering model.
+- **Rejected:** rewriting the customer's actual message or adding prior questions to every search.
+- **Cost:** the cleaner and follow-up detector are rule-based; unusual phrasing may be missed or classified incorrectly. The decision SSE event exposes the generated search query for debugging, but server decision logs omit it.
+
+## 27. Short, structured answerability grading
+- **Chose:** request JSON from the grader with a small `max_tokens` limit (80), validate its result, and avoid calling it when retrieval returns no hits.
+- **Rejected:** spending a full generation-sized response on the grading step or grading an empty context.
+- **Cost:** the grader may still add latency on normal questions with hits, and provider JSON-mode support varies. The implementation falls back to retrieval confidence if grading raises an error.
+
+## 28. Stream decisions and latency measurements
+- **Chose:** send an SSE decision event with outcome, reason, grading fields, retrieval scores, and search query; report TTFT and per-node elapsed time in the final completion event.
+- **Rejected:** relying on manual stopwatch measurements or inferring why an escalation happened from the final handoff alone.
+- **Cost:** telemetry adds fields to the stream contract. Customer question text and search query are excluded from decision logs.
+
+## 29. Filter handoff history and constrain answer claims
+- **Chose:** omit exact stored assistant handoff messages from the recent history sent to answer generation, and instruct both grounded and no-context prompts that the assistant cannot claim to have contacted, notified, or handed work to a human. Grounded prompts also prohibit adding facts absent from context.
+- **Rejected:** allowing a later answer to repeat a stored handoff as if a new escalation had occurred, or expanding a short source into unsupported detail.
+- **Cost:** history filtering relies on exact matches to the configured handoff text. Prompt rules reduce unsupported claims but are not a formal guarantee; citations and escalation routing remain controlled by the application.
