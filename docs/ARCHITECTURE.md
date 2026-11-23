@@ -203,4 +203,4 @@ erDiagram
 2. Every query filters by `tenant_id`, through the shared `get_owned` helper for lookups by id.
 3. Another tenant's object returns 404, not 403, so ids cannot be probed.
 4. Vector searches (Week 3) always carry a tenant filter.
-5. Week 6 adds PostgreSQL Row-Level Security as a second line of defense.
+5. Week 6 adds PostgreSQL Row-Level Security as a second line of defense..

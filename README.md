@@ -148,4 +148,4 @@ Base path `/api/v1`
 - [Design decisions and trade-offs](DECISIONS.md)
 
 ## Author
-Banothu Nithin, Full Stack and Applied AI Engineer, Hyderabad.
+Banothu Nithin, Full Stack and Applied AI Engineer, Hyderabad..
