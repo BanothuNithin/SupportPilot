@@ -6,6 +6,10 @@ os.environ["MIN_CONFIDENCE"] = "0.5"
 os.environ["RAG_TOP_K"] = "4"
 os.environ["LLM_SMALL_MODEL"] = ""
 os.environ["LLM_FALLBACK_MODEL"] = ""
+os.environ["INTEGRATIONS_KEY"] = "wvyzx2-IJJG-H42krUEt_EDr8IJhsVQ23o_gdCwEeNU="
+os.environ["LLM_PROVIDER"] = "fake"
+os.environ["EMBED_PROVIDER"] = "fake"
+os.environ["QDRANT_URL"] = ":memory:"
 
 import fakeredis.aioredis  # noqa: E402
 import app.core.redis as redis_mod  # noqa: E402

@@ -135,3 +135,48 @@ Each entry: what I chose, what I rejected, and what it costs.
 - **Chose:** omit exact stored assistant handoff messages from the recent history sent to answer generation, and instruct both grounded and no-context prompts that the assistant cannot claim to have contacted, notified, or handed work to a human. Grounded prompts also prohibit adding facts absent from context.
 - **Rejected:** allowing a later answer to repeat a stored handoff as if a new escalation had occurred, or expanding a short source into unsupported detail.
 - **Cost:** history filtering relies on exact matches to the configured handoff text. Prompt rules reduce unsupported claims but are not a formal guarantee; citations and escalation routing remain controlled by the application.
+
+## 30. AI proposes actions; staff approve them
+- **Chose:** create pending GitHub or Slack proposals for configured integrations when rules detect a bug report. Owners and admins can edit, approve, reject, or retry a failed action.
+- **Rejected:** letting the AI or an MCP tool execute a side effect without explicit staff approval.
+- **Cost:** an issue or alert is not sent until a staff member approves it, so action completion depends on human review. Approved work currently runs in the request rather than a durable worker.
+
+## 31. Run one MCP stdio subprocess per approved action
+- **Chose:** use the official Python MCP SDK (`mcp~=1.30.0`) and start the custom stdio server for each action. Decrypted credentials are supplied only in the subprocess environment, never in MCP tool arguments.
+- **Rejected:** putting secrets in tool messages or maintaining a long-lived in-process tool server.
+- **Cost:** process startup adds latency and there is no subprocess pool. An action can remain approved if the process crashes before its result is saved.
+
+## 32. Allow-list and validate executable tools
+- **Chose:** expose only `create_github_issue` and `post_slack_alert` through a registry, validate their arguments with Pydantic, and sanitize text before execution.
+- **Rejected:** dispatching arbitrary tool names or accepting unvalidated model-generated arguments.
+- **Cost:** adding an integration action requires an explicit registry entry, schema, sanitizer decision, server implementation, and tests.
+
+## 33. Encrypt integration configuration with Fernet
+- **Chose:** encrypt each tenant's GitHub repository/token and Slack webhook URL with Fernet using `INTEGRATIONS_KEY`; API responses return configured state and masked summaries, not the credentials.
+- **Rejected:** storing credentials in plaintext or returning them to prefill the settings UI.
+- **Cost:** the application must retain the environment-provided key to decrypt stored credentials. There is no key rotation or KMS-backed key management yet; losing the key makes the stored credentials unreadable.
+
+## 34. Use an atomic compare-and-set for approval
+- **Chose:** update an action to `approved` with one conditional database update from `pending` or `failed`, and execute only when exactly one row changed.
+- **Rejected:** a read-then-update approval check that could allow concurrent requests to execute the same action twice.
+- **Cost:** this prevents concurrent double approvals, but it does not provide a durable worker or recover an action automatically if the process crashes between approval and completion.
+
+## 35. Validate Slack webhook destinations from parsed URLs
+- **Chose:** parse the submitted URL and require HTTPS, the exact `hooks.slack.com` hostname, and a path beginning with `/services/`.
+- **Rejected:** raw-string prefix or substring checks that can accept attacker-controlled lookalike hosts.
+- **Cost:** the integration is limited to Slack's incoming-webhook host and path; other Slack-compatible endpoints are not supported.
+
+## 36. Sanitize and fence customer-reported text
+- **Chose:** insert a zero-width space after GitHub `@` mentions, escape `&`, `<`, and `>` for Slack, strip control characters, and place customer text in a code fence longer than any backtick run in the text, labeled untrusted.
+- **Rejected:** forwarding customer text unchanged or treating it as instructions for the AI or action executor.
+- **Cost:** sanitization changes the displayed or transmitted text and is a defense-in-depth measure, not a guarantee against every downstream interpretation.
+
+## 37. Use tenant-scoped Redis pub/sub for live conversation updates
+- **Chose:** publish message events to channels containing both tenant and conversation IDs, stream them to authenticated subscribers over SSE, and send heartbeats. The frontend refetches messages after reconnecting.
+- **Rejected:** a global conversation channel or adding a persistent bidirectional transport for staff replies.
+- **Cost:** publication is best-effort and events are not retained or replayed; reconnect recovery depends on refetching persisted messages.
+
+## 38. Keep handoff replies truthful and out of later model history
+- **Chose:** tell bug reporters that a ticket was created and the team will follow up here, without claiming that GitHub, Slack, or a person was already contacted. Exclude exact stored handoff replies from later model history.
+- **Rejected:** wording that implies an external notification was sent, or feeding a previous handoff back to the model as ordinary assistant content.
+- **Cost:** handoff history filtering relies on exact configured reply text, and the reply cannot guarantee when the team will follow up.

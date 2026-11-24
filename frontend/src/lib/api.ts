@@ -5,6 +5,7 @@ const KEY = "supportpilot.tokens";
 
 type Tokens = { access_token: string; refresh_token: string };
 export type Conversation = { id: string; customer_id: string; status: string; created_at: string };
+export type StaffUser = { id: string; tenant_id: string; role: "owner" | "admin" | "agent" };
 export type Citation = {
   n: number;
   document_id: string;
@@ -17,6 +18,7 @@ export type Message = {
   id: string;
   sender: "customer" | "ai" | "human";
   content: string;
+  author_id?: string | null;
   created_at?: string;
   citations?: Citation[] | null;
 };
@@ -126,6 +128,30 @@ export async function listConversations(): Promise<Conversation[]> {
 export async function getMessages(id: string): Promise<Message[]> {
   const conv = await json<{ messages: Message[] }>(await authFetch(`/conversations/${id}`));
   return conv.messages;
+}
+
+export async function getCurrentUser(): Promise<StaffUser> {
+  return json(await authFetch("/auth/me"));
+}
+
+export async function postHumanReply(id: string, content: string): Promise<Message> {
+  const response = await authFetch(`/conversations/${id}/human-reply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  if (!response.ok) {
+    let message = `Request failed (${response.status})`;
+    try {
+      const data = await response.json();
+      if (typeof data.detail === "string") message = data.detail;
+      else if (data.detail) message = JSON.stringify(data.detail);
+    } catch {
+      // Keep the HTTP status when the server response is not JSON.
+    }
+    throw new Error(message);
+  }
+  return response.json();
 }
 
 // Staff test-chat needs a customer. Reuse the first one, or create a demo customer.

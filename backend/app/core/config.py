@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     llm_fallback_base_url: str = ''
     llm_fallback_api_key: str = ''
     min_confidence: float = 0.5
+    integrations_key: str = ""
+    github_api_base: str = "https://api.github.com"
+    frontend_base_url: str = "http://localhost:3000"
+    mcp_timeout_seconds: int = 30
 
 
 settings = Settings()

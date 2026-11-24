@@ -7,7 +7,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text, Uuid, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -72,6 +72,9 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text)
     citations: Mapped[str | None] = mapped_column(Text)  # JSON string for now
     trace_id: Mapped[str | None] = mapped_column(String(64))  # Langfuse trace link (Week 7)
+    author_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", name="fk_messages_author_id_users")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
 
@@ -105,3 +108,48 @@ class Document(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class Integration(Base):
+    __tablename__ = "integrations"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    config_encrypted: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_now,
+        onupdate=_now,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("uq_integrations_tenant_kind", "tenant_id", "kind", unique=True),
+    )
+
+
+class PendingAction(Base):
+    __tablename__ = "pending_actions"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), index=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"))
+    ticket_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tickets.id"))
+    tool: Mapped[str] = mapped_column(String(50))
+    arguments: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="pending", server_default="pending")
+    result: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    edited: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    decided_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_pending_actions_tenant_status", "tenant_id", "status"),
+    )

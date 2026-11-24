@@ -30,6 +30,7 @@ def test_fast_path_rules(question, expected):
         ("this is the worst service, I want a refund", "complaint", "medium"),
         ("how do I update my address", "question", "medium"),
         ("Hello", "chitchat", "low"),
+        ("the dashboard freezes when I click Export", "bug_report", "medium"),
     ],
 )
 def test_rule_triage(question, intent, priority):

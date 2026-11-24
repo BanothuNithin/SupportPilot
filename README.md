@@ -2,9 +2,9 @@
 
 ![CI](https://github.com/BanothuNithin/supportpilot/actions/workflows/ci.yml/badge.svg)
 
-**A multi-tenant, agentic AI customer support platform under development.** Week 4 delivers a deterministic LangGraph support workflow with tenant-scoped retrieval, grounded answers, and ticket-based human escalation. Approved MCP actions (such as GitHub issues and Slack alerts) remain planned.
+**A multi-tenant, agentic AI customer support platform under development.** Week 5 adds tenant-configured GitHub and Slack integrations, approval-gated MCP actions, staff replies, and live conversation updates to the deterministic support workflow.
 
-> **Status: Week 4 of 8.** The multi-tenant foundation, chat UI and streaming, tenant-isolated knowledge-base retrieval, and rule-driven support agent workflow are built and tested. I'm building this in public; see the roadmap below.
+> **Status: Week 5 of 8.** The multi-tenant foundation, chat UI and streaming, tenant-isolated knowledge-base retrieval, support workflow, approval-gated integrations, and staff conversation tools are built. The backend test suite reports 184 passing tests. I'm building this in public; see the roadmap below.
 
 ![Architecture](docs/architecture.png)
 
@@ -13,16 +13,16 @@ Most AI support bots only answer questions. Real support needs three more things
 
 1. **Data isolation:** many companies share one platform; their data must never mix.
 2. **Reliable answers:** cite sources, and say "I don't know" (and route to a support ticket when needed) instead of guessing.
-3. **Action:** support issues should reach the right team; ticket alerts and approval-gated integrations are planned.
+3. **Action:** support issues can become tickets and proposed external actions, which staff review and approve.
 
-## What works today (Week 4)
+## What works today (Week 5)
 - Tenant registration: creating a company also creates its owner
 - JWT access tokens (15 min) plus refresh tokens with **rotation**, stored hashed in Redis; logout revokes them
 - Role-based access control: `owner`, `admin`, `agent`
 - Login rate limiting (5 attempts per minute per IP, Redis)
 - Tenant-scoped customers and conversations API (other tenants' objects return 404)
 - PostgreSQL schema managed with Alembic migrations
-- 110 backend tests, including tenant-isolation and agent workflow tests, run in GitHub Actions
+- 184 backend tests, including tenant-isolation, action approval, and live conversation tests
 - Docker Compose for PostgreSQL, Redis, Qdrant and MinIO
 - Next.js chat UI with SSE replies and a Stop button to cancel generation
 - Tenant-scoped knowledge-base upload (up to 5 MB), listing and deletion for `.txt`, `.md` and `.pdf` files; status moves from `indexing` to `ready` or `failed`, with a chunk count and failure error
@@ -42,6 +42,14 @@ Most AI support bots only answer questions. Real support needs three more things
 - Next.js knowledge-base page with upload, status polling and delete; AI answers show chips only for sources they reference
 - Retrieval failures are logged and chat continues without knowledge-base context
 - Frontend lint and production build checks in GitHub Actions
+- Per-tenant GitHub repository/token and Slack incoming-webhook integrations; credentials are Fernet-encrypted at rest and API responses contain masked summaries only
+- Owners and admins configure integrations; any staff member can view integration status
+- A custom MCP stdio server exposes `create_github_issue` and `post_slack_alert`; credentials are passed in the subprocess environment, never as tool arguments
+- An allow-listed, Pydantic-validated tool registry sanitizes GitHub mentions and escapes Slack markup; Slack webhook hosts are validated from parsed URLs
+- Rule-detected bug reports create a ticket and propose actions only for configured integrations; the handoff reply does not claim that GitHub or Slack was contacted
+- Owners and admins can edit, approve, reject, and retry proposed actions; an atomic compare-and-set prevents concurrent approvals from executing the same action twice
+- Staff can reply in escalated conversations; Redis pub/sub delivers tenant-scoped SSE updates with heartbeats, and clients refetch after reconnecting
+- Integrations settings and staff conversation pages support configuration, action approvals, ticket status updates, staff replies, and live human messages
 
 ## Tech stack
 | Layer | Technology | Status |
@@ -52,7 +60,7 @@ Most AI support bots only answer questions. Real support needs three more things
 | Frontend | Next.js, TypeScript | Done |
 | RAG | Qdrant, embeddings, citations | Done |
 | Agents | LangGraph rule-based triage, retrieval, grader, resolver and escalation; OpenAI-compatible model provider/router | Built |
-| Tools | Custom MCP server (GitHub, Slack, browser), human approval for actions | Week 5 |
+| Tools | Custom MCP stdio server using official Python SDK `mcp~=1.30.0` (GitHub issues and Slack alerts), allow-listed tools, human approval | Built |
 | Storage and workers | MinIO / S3, background jobs | Week 6 |
 | Observability | Langfuse, RAGAS evals in CI | Week 7 |
 | Deployment | Kubernetes, Terraform | Week 8 |
@@ -88,11 +96,38 @@ docker compose up -d postgres redis qdrant minio
 cd backend
 python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+```
+
+### Configure integrations
+
+Integration credentials require `INTEGRATIONS_KEY`. After installing backend dependencies, generate a Fernet key from the `backend` directory:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Copy the output into the repository-root `.env`:
+
+```env
+INTEGRATIONS_KEY=<generated Fernet key>
+```
+
+Keep this key backed up and stable across restarts. If it is lost, stored integration credentials cannot be decrypted. The key is not a GitHub token or `JWT_SECRET`.
+
+Start the backend after adding `INTEGRATIONS_KEY` to `.env`:
+
+```bash
 alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
 Open http://localhost:8000/docs for the interactive API.
+
+In the staff UI, open **Integrations** and configure GitHub and/or Slack. Only owners and admins can save or remove credentials. Use a private GitHub repository: issue bodies include customer-reported text, marked as untrusted.
+
+For GitHub, create a fine-grained personal access token in **GitHub Settings → Developer settings → Personal access tokens → Fine-grained tokens**. Select the resource owner and the single private repository SupportPilot should use; grant **Issues: Read and write** only, choose an appropriate expiration, and paste the token with the repository in `owner/repository` form. The token is encrypted at rest and is not shown again.
+
+For Slack, create or select a Slack app for the intended workspace, enable **Incoming Webhooks**, add a webhook to the intended channel, and paste the generated `https://hooks.slack.com/services/...` URL. Each tenant currently has one Slack webhook/channel.
 
 Run the tests (no Docker needed, they use SQLite and a fake Redis):
 ```bash
@@ -114,6 +149,14 @@ Base path `/api/v1`
 | `POST/GET/PATCH/DELETE /customers` | Tenant-scoped customers (delete: owner, admin) | Authenticated |
 | `POST/GET /conversations`, `GET /conversations/{id}` | Tenant-scoped conversations with messages and saved citations | Authenticated |
 | `POST /conversations/{id}/messages` | Stream step, triage, decision, citations, tokens, escalated, done and error events | Authenticated |
+| `GET /conversations/{id}/events` | Subscribe to tenant-scoped live message events and heartbeats over SSE | Authenticated |
+| `POST /conversations/{id}/human-reply` | Add a staff reply to an escalated conversation | Authenticated staff |
+| `GET /integrations` | List configured integration kinds and masked summaries | Authenticated staff |
+| `PUT /integrations/github`, `PUT /integrations/slack` | Configure per-tenant credentials | Owner, Admin |
+| `DELETE /integrations/{kind}` | Remove a per-tenant integration | Owner, Admin |
+| `GET /actions?status=&ticket_id=&conversation_id=` | List tenant-scoped proposed actions; filters can be combined | Authenticated staff |
+| `POST /actions/{id}/approve` | Approve a proposal, optionally with edited arguments; execute it through MCP | Owner, Admin |
+| `POST /actions/{id}/reject` | Reject a pending proposal | Owner, Admin |
 | `POST /documents` | Upload a `.txt`, `.md` or `.pdf` for indexing (returns 202; agents get 403) | Owner, Admin |
 | `GET /documents` | List this tenant's documents | Authenticated |
 | `DELETE /documents/{id}` | Delete a tenant document and its vectors (agents get 403) | Owner, Admin |
@@ -130,6 +173,13 @@ Base path `/api/v1`
 - Rule-based triage is intentionally conservative and may need tuning as real support language is observed.
 - The answerability grader is still an LLM judgment; if grading fails, the current implementation falls back to the top retrieval score.
 - The search-query cleaner and follow-up detector use rules, so unusual phrasing may not be normalized or expanded as intended.
+- Approved actions execute inside the HTTP request; there is no worker or retry queue yet (planned for Week 6). A process crash after an action is marked approved but before it is marked executed can leave it approved.
+- Each approved action starts a separate MCP subprocess; there is no process pool.
+- Each tenant can configure one GitHub repository and one Slack webhook/channel.
+- Redis pub/sub is fire-and-forget and has no event replay. The frontend refetches conversation messages after reconnecting.
+- Customers are still simulated through the staff chat; customer-widget authentication is not implemented.
+- Bug detection is regex-based and may miss or misclassify reports.
+- The Fernet encryption key is supplied through an environment variable; key rotation and KMS integration are not implemented.
 
 ## Roadmap
 | Week | Focus |
@@ -138,7 +188,7 @@ Base path `/api/v1`
 | 2 | Next.js chat UI, SSE streaming (done) |
 | 3 | RAG ingestion, Qdrant, citations (done) |
 | 4 | LangGraph support workflow, deterministic triage and fast paths, follow-up-aware retrieval, grading, escalation, and streaming observability (done) |
-| 5 | MCP tools and approval-gated actions |
+| 5 | Per-tenant GitHub and Slack integrations, MCP tools, approval-gated actions, staff replies and live conversation updates (done) |
 | 6 | Redis workers, S3, Postgres Row-Level Security |
 | 7 | Langfuse, RAGAS evals in CI, load tests |
 | 8 | Kubernetes, Terraform, live deployment |

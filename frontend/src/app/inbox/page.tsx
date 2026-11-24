@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { AuthError, getTokens } from "@/lib/api";
+import { listActions } from "@/lib/actions";
 import { Ticket, listTickets, setTicketStatus } from "@/lib/tickets";
 
 const priorityStyle: Record<string, string> = {
@@ -16,11 +17,13 @@ const reasonLabel: Record<string, string> = {
   customer_requested_human: "Customer asked for a human",
   no_reliable_answer: "No reliable answer in the documents",
   low_confidence: "Low confidence",
+  bug_report: "Bug report",
 };
 
 export default function InboxPage() {
   const router = useRouter();
   const [tickets, setTickets] = useState<Ticket[]>([]);
+  const [pendingCounts, setPendingCounts] = useState<Record<string, number>>({});
   const [error, setError] = useState("");
 
   const handleError = useCallback(
@@ -38,7 +41,15 @@ export default function InboxPage() {
     }
     (async () => {
       try {
-        setTickets(await listTickets());
+        const [loadedTickets, pendingActions] = await Promise.all([
+          listTickets(),
+          listActions({ status: "pending" }),
+        ]);
+        setTickets(loadedTickets);
+        setPendingCounts(pendingActions.reduce<Record<string, number>>((counts, action) => {
+          counts[action.conversation_id] = (counts[action.conversation_id] ?? 0) + 1;
+          return counts;
+        }, {}));
       } catch (e) {
         handleError(e);
       }
@@ -72,6 +83,11 @@ export default function InboxPage() {
                 <div className="min-w-0">
                   <p className="truncate font-medium">{t.title}</p>
                   <p className="text-xs text-slate-400">{t.reason ? (reasonLabel[t.reason] ?? t.reason) : ""}</p>
+                  {pendingCounts[t.conversation_id] > 0 && (
+                    <span className="mt-1 inline-flex rounded-full bg-violet-900/60 px-2 py-0.5 text-xs text-violet-200">
+                      {pendingCounts[t.conversation_id]} pending action{pendingCounts[t.conversation_id] === 1 ? "" : "s"}
+                    </span>
+                  )}
                 </div>
                 <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${priorityStyle[t.priority]}`}>{t.priority}</span>
               </div>
@@ -86,6 +102,9 @@ export default function InboxPage() {
                     {s.replace("_", " ")}
                   </button>
                 ))}
+                <Link href={`/inbox/${t.conversation_id}`} className="ml-auto rounded-lg bg-violet-600 px-3 py-1 text-xs font-semibold text-white hover:bg-violet-500">
+                  Open
+                </Link>
               </div>
             </li>
           ))}

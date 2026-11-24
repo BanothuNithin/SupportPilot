@@ -4,6 +4,7 @@ import logging
 from time import perf_counter
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import datetime
 
 import anyio
 from fastapi import APIRouter, Depends
@@ -13,6 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import Send
 
 from app.agents import prompts
+from app.actions.proposals import build_bug_report_actions
+from app.integrations.service import is_configured
+from app.realtime import publish_message
 from app.agents.graph import graph
 from app.api.deps import get_current_user
 from app.api.tenant import get_owned
@@ -20,7 +24,7 @@ from app.core.config import settings
 from app.db.session import SessionLocal, get_db
 from app.llm import get_llm
 from app.llm.base import LLMError, LLMProvider
-from app.models import Conversation, Message, Ticket, User
+from app.models import Conversation, Message, PendingAction, Ticket, User
 from app.schemas.message import MessageIn
 
 router = APIRouter(prefix="/conversations", tags=["chat"])
@@ -80,7 +84,8 @@ async def persist_reply(
     outcome: str | None,
     reason: str | None,
     priority: str,
-) -> tuple[str, str | None]:
+    history: list[dict] | None = None,
+) -> tuple[str, str | None, datetime]:
     """Save the AI reply and escalation state in one transaction."""
     async with SessionLocal() as session:
         msg = Message(
@@ -108,8 +113,40 @@ async def persist_reply(
             conv.status = "escalated"
             await session.flush()
             ticket_id = str(ticket.id)
+            if reason == "bug_report":
+                for tool, arguments in build_bug_report_actions(
+                    question,
+                    history or [],
+                    ticket.id,
+                    conv_id,
+                    priority,
+                ):
+                    spec_kind = "github" if tool == "create_github_issue" else "slack"
+                    if not await is_configured(session, tenant_id, spec_kind):
+                        continue
+                    open_action = await session.scalar(
+                        select(PendingAction.id)
+                        .where(
+                            PendingAction.tenant_id == tenant_id,
+                            PendingAction.conversation_id == conv_id,
+                            PendingAction.tool == tool,
+                            PendingAction.status.in_(["pending", "approved"]),
+                        )
+                        .limit(1)
+                    )
+                    if open_action is not None:
+                        continue
+                    session.add(PendingAction(
+                        tenant_id=tenant_id,
+                        conversation_id=conv_id,
+                        ticket_id=ticket.id,
+                        tool=tool,
+                        arguments=json.dumps(arguments),
+                        status="pending",
+                    ))
         await session.commit()
-        return str(msg.id), ticket_id
+        await session.refresh(msg)
+        return str(msg.id), ticket_id, msg.created_at
 
 
 @router.post("/{conversation_id}/messages")
@@ -125,8 +162,30 @@ async def send_message(
     was_escalated = conv.status == "escalated"
     if conv.status == "resolved":
         conv.status = "ai_handling"
-    db.add(Message(tenant_id=tenant_id, conversation_id=conv_id, sender="customer", content=body.content))
+    customer_message = Message(
+        tenant_id=tenant_id,
+        conversation_id=conv_id,
+        sender="customer",
+        content=body.content,
+    )
+    db.add(customer_message)
     await db.commit()
+    await db.refresh(customer_message)
+    if not was_escalated:
+        await publish_message(
+            tenant_id,
+            conv_id,
+            {
+                "type": "message",
+                "message": {
+                    "id": str(customer_message.id),
+                    "sender": "customer",
+                    "content": customer_message.content,
+                    "author_id": None,
+                    "created_at": str(customer_message.created_at),
+                },
+            },
+        )
 
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -135,6 +194,20 @@ async def send_message(
             select(Ticket.id)
             .where(Ticket.conversation_id == conv_id, Ticket.status != "resolved")
             .order_by(Ticket.created_at.desc())
+        )
+        await publish_message(
+            tenant_id,
+            conv_id,
+            {
+                "type": "message",
+                "message": {
+                    "id": str(customer_message.id),
+                    "sender": "customer",
+                    "content": customer_message.content,
+                    "author_id": None,
+                    "created_at": str(customer_message.created_at),
+                },
+            },
         )
 
         async def waiting():
@@ -216,7 +289,7 @@ async def send_message(
                 yield sse("error", {"detail": "The model returned an empty answer."})
                 return
             with anyio.CancelScope(shield=True):
-                message_id, ticket_id = await persist_reply(
+                message_id, ticket_id, message_created_at = await persist_reply(
                     tenant_id,
                     conv_id,
                     body.content,
@@ -225,7 +298,22 @@ async def send_message(
                     result.get("outcome"),
                     result.get("reason"),
                     result["triage"].priority,
+                    history,
                 )
+            await publish_message(
+                tenant_id,
+                conv_id,
+                {
+                    "type": "message",
+                    "message": {
+                        "id": message_id,
+                        "sender": "ai",
+                        "content": answer,
+                        "author_id": None,
+                        "created_at": str(message_created_at),
+                    },
+                },
+            )
             saved = True
             if result.get("outcome") == "escalate":
                 yield sse("escalated", {"ticket_id": ticket_id, "reason": result.get("reason")})

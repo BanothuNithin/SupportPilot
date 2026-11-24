@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -13,6 +14,7 @@ import {
   logout,
   streamMessage,
 } from "@/lib/api";
+import { subscribeConversation } from "@/lib/events";
 
 const STEP_STATUS: Record<string, string> = {
   triage: "Understanding your question...",
@@ -80,6 +82,40 @@ export default function ChatPage() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    if (!activeId || !getTokens()) return;
+    const controller = new AbortController();
+    (async () => {
+      try {
+        await subscribeConversation(
+          activeId,
+          (message) => {
+            if (controller.signal.aborted || message.sender !== "human") return;
+            setMessages((current) =>
+              current.some((existing) => existing.id === message.id)
+                ? current
+                : [...current, message],
+            );
+          },
+          controller.signal,
+          async () => {
+            if (controller.signal.aborted) return;
+            const latest = await getMessages(activeId);
+            if (controller.signal.aborted) return;
+            setMessages((current) => {
+              const byId = new Map(current.map((message) => [message.id, message]));
+              for (const message of latest) byId.set(message.id, message);
+              return [...byId.values()];
+            });
+          },
+        );
+      } catch (e) {
+        if (!controller.signal.aborted) handleError(e);
+      }
+    })();
+    return () => controller.abort();
+  }, [activeId, handleError]);
 
   async function newChat() {
     try {
@@ -160,12 +196,15 @@ export default function ChatPage() {
         <button onClick={newChat} className="mx-3 mb-3 rounded-lg bg-violet-600 py-2 text-sm font-semibold hover:bg-violet-500">
           + New chat
         </button>
-        <a href="/documents" className="mx-3 mb-3 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-slate-800">
+        <Link href="/documents" className="mx-3 mb-3 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-slate-800">
           Knowledge base
-        </a>
-        <a href="/inbox" className="mx-3 mb-3 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-slate-800">
+        </Link>
+        <Link href="/inbox" className="mx-3 mb-3 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-slate-800">
           Escalations
-        </a>
+        </Link>
+        <Link href="/settings/integrations" className="mx-3 mb-3 rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-slate-800">
+          Integrations
+        </Link>
         <div className="flex-1 space-y-1 overflow-y-auto px-3">
           {conversations.map((c) => (
             <button
@@ -206,6 +245,7 @@ export default function ChatPage() {
             return (
               <div key={m.id} className={`flex ${m.sender === "customer" ? "justify-end" : "justify-start"}`}>
                 <div className={m.sender === "customer" ? "max-w-xl" : "flex max-w-xl flex-col items-start"}>
+                  {m.sender === "human" && <span className="mb-1 text-xs font-semibold text-violet-300">Agent</span>}
                   <div
                     className={`whitespace-pre-wrap rounded-2xl px-4 py-2 ${
                       m.sender === "customer" ? "bg-violet-600 text-white" : "bg-slate-800 text-slate-100"

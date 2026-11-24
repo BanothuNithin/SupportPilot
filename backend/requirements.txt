@@ -17,3 +17,5 @@ alembic>=1.13
 qdrant-client>=1.12
 pypdf>=5.0
 langgraph>=1.0
+cryptography>=43
+mcp~=1.30.0

@@ -9,6 +9,7 @@ GRADE = (
 
 HANDOFF = {
     "customer_requested_human": "Of course. I've passed this conversation to a human agent, who will reply here as soon as possible.",
+    "bug_report": "Thanks for reporting this. I've created a ticket for our team to look into, and they'll follow up here.",
     "no_reliable_answer": (
         "I couldn't find a reliable answer to that in our documentation, so I've passed your question "
         "to a human agent. They will reply here as soon as possible."

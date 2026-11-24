@@ -1,18 +1,20 @@
-# Architecture (Week 4)
+# Architecture (Week 5)
 
 Solid boxes are built. Dashed boxes are planned (week in brackets).
 
 ```mermaid
 flowchart TD
-    UI["Next.js chat and knowledge-base UI"]:::done
-    API["FastAPI: auth, RBAC, tenant scoping, SSE and persistence"]:::done
+    UI["Next.js chat, inbox, integrations settings and staff conversation UI"]:::done
+    API["FastAPI: auth, RBAC, tenant-scoped APIs, SSE and persistence"]:::done
     AG["LangGraph support workflow: rule triage, grader, resolver, escalation"]:::done
     RAG["Query cleanup, follow-up expansion, embeddings and prompt assembly"]:::done
     QD[("Qdrant: chunks, tenant-filtered search")]:::done
     LLM["OpenAI-compatible LLM provider (Ollama in local setup)"]:::done
-    MCP["MCP tools: GitHub, Slack, browser (Week 5)"]:::planned
-    PG[("PostgreSQL")]:::done
-    RD[("Redis: refresh tokens, rate limits")]:::done
+    MCP["Custom MCP stdio server: create_github_issue, post_slack_alert"]:::done
+    GH["GitHub Issues API"]:::done
+    SL["Slack incoming webhook"]:::done
+    PG[("PostgreSQL: tickets, messages, encrypted integrations, pending actions")]:::done
+    RD[("Redis: refresh tokens, rate limits, tenant-scoped pub/sub")]:::done
     S3[("MinIO / S3 (Week 6)")]:::planned
     OBS["Langfuse + RAGAS (Week 7)"]:::planned
 
@@ -24,6 +26,9 @@ flowchart TD
     AG --> LLM
     API --> PG
     API --> RD
+    API -->|"approved action: spawn process; credentials in environment"| MCP
+    MCP --> GH
+    MCP --> SL
     RAG -.-> S3
     AG -.-> OBS
 
@@ -42,6 +47,83 @@ flowchart TD
 8. The API streams step, triage, decision, citations, token, escalation, and completion events. The decision event includes search diagnostics; server logs omit the customer question and search query. The final event includes time to first token and per-node timings.
 
 The grader is the only LLM completion before answer generation. Fast paths make no grader call; the resolver still uses the configured model provider to generate responses.
+
+## Bug-report proposals and approval (built)
+
+Bug detection is rule-based. A bug report creates a ticket and a truthful handoff reply. For each configured integration, the application creates a pending action; the AI does not execute external side effects. GitHub issue text includes customer-reported text in a dynamically sized code fence labeled `UNTRUSTED`. Tool arguments are Pydantic-validated and sanitized by the allow-listed registry.
+
+```mermaid
+sequenceDiagram
+    participant C as Chat UI (customer simulated in staff chat)
+    participant A as FastAPI chat API
+    participant G as Rule-based agent
+    participant D as PostgreSQL
+    participant S as Staff conversation UI
+    participant O as Owner or Admin
+    participant E as Actions API
+    participant M as MCP stdio subprocess
+    participant GH as GitHub Issues API
+    participant SL as Slack incoming webhook
+
+    C->>A: POST /api/v1/conversations/{id}/messages (bug report)
+    A->>D: Save customer message
+    A->>G: Triage using deterministic rules
+    G-->>A: Escalate with reason bug_report
+    A->>D: One transaction: save handoff, ticket, and configured pending actions
+    A-->>C: Stream truthful ticket-created reply
+    S->>E: GET /api/v1/actions?conversation_id={id}
+    E->>D: List actions filtered by tenant and conversation
+    D-->>E: Pending proposals
+    E-->>S: Proposal arguments and status
+    O->>E: POST /api/v1/actions/{id}/approve (optional edited arguments)
+    E->>D: Atomic compare-and-set pending/failed to approved
+    E->>D: Read tenant-scoped encrypted integration
+    E->>E: Decrypt integration configuration
+    alt GitHub issue action
+        E->>M: Start MCP process; pass GitHub credentials in environment
+        Note over E,M: Tool arguments contain issue text and labels, never credentials
+        M->>GH: POST issue with validated, sanitized arguments
+        GH-->>M: Issue number and URL
+    else Slack alert action
+        E->>M: Start MCP process; pass webhook URL in environment
+        M->>SL: POST alert with validated, escaped text
+        SL-->>M: Success or HTTP error
+    end
+    M-->>E: Tool result or redacted error
+    E->>D: Save executed or failed status and result
+    E-->>S: Return updated action
+    opt Failed action retry
+        O->>E: Approve failed action again
+    end
+```
+
+The official Python MCP SDK is pinned at `mcp~=1.30.0`. One subprocess is started per approved action. The GitHub and Slack operations are separate proposals and are approved independently. The approval endpoint uses a database compare-and-set so concurrent approvals do not execute the same action twice.
+
+## Staff replies and live conversation updates (built)
+
+```mermaid
+sequenceDiagram
+    participant S as Staff conversation UI
+    participant A as FastAPI conversations API
+    participant D as PostgreSQL
+    participant R as Redis pub/sub
+    participant C as Chat UI (customer simulated in staff chat)
+
+    S->>A: POST /api/v1/conversations/{id}/human-reply
+    A->>D: Verify tenant and escalated status
+    A->>D: Save human message and update open ticket
+    A->>R: Publish message to conv:{tenant_id}:{conversation_id}
+    A-->>S: Return saved message
+    C->>A: GET /api/v1/conversations/{id}/events
+    A->>D: Verify conversation belongs to tenant before subscribing
+    A->>R: Subscribe to tenant-scoped channel
+    R-->>A: Published message event
+    A-->>C: SSE event: message
+    A-->>C: SSE heartbeat while idle
+    Note over C,A: On reconnect, refetch persisted messages; pub/sub does not replay
+```
+
+Publishing is best-effort and happens after the database commit. SSE subscribers receive heartbeats; the client reconnects with backoff and refetches persisted messages after reconnecting. Redis pub/sub is not a durable event log.
 
 ## Document ingestion (built)
 ```mermaid
@@ -152,7 +234,13 @@ erDiagram
     CUSTOMERS ||--o{ CONVERSATIONS : starts
     CONVERSATIONS ||--o{ MESSAGES : contains
     CONVERSATIONS ||--o{ TICKETS : escalates_to
+    CONVERSATIONS ||--o{ PENDING_ACTIONS : proposes
     USERS ||--o{ TICKETS : assigned
+    USERS ||--o{ MESSAGES : authors
+    USERS ||--o{ PENDING_ACTIONS : decides
+    TENANTS ||--o{ INTEGRATIONS : configures
+    TENANTS ||--o{ PENDING_ACTIONS : owns
+    TICKETS o|--o{ PENDING_ACTIONS : tracks
     TENANTS {
         uuid id PK
         string name
@@ -178,15 +266,36 @@ erDiagram
     }
     MESSAGES {
         uuid id PK
+        uuid tenant_id FK
         uuid conversation_id FK
+        uuid author_id FK
         string sender
         text content
     }
     TICKETS {
         uuid id PK
+        uuid tenant_id FK
         uuid conversation_id FK
         string priority
         string status
+    }
+    INTEGRATIONS {
+        uuid id PK
+        uuid tenant_id FK
+        string kind
+        text config_encrypted
+    }
+    PENDING_ACTIONS {
+        uuid id PK
+        uuid tenant_id FK
+        uuid conversation_id FK
+        uuid ticket_id FK
+        uuid decided_by FK
+        string tool
+        string status
+        text arguments
+        text result
+        boolean edited
     }
     DOCUMENTS {
         uuid id PK
