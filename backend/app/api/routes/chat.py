@@ -24,7 +24,7 @@ from app.core.config import settings
 from app.db.session import SessionLocal, get_db
 from app.llm import get_llm
 from app.llm.base import LLMError, LLMProvider
-from app.models import Conversation, Message, PendingAction, Ticket, User
+from app.models import Conversation, Document, Message, PendingAction, Ticket, User
 from app.schemas.message import MessageIn
 
 router = APIRouter(prefix="/conversations", tags=["chat"])
@@ -229,7 +229,21 @@ async def send_message(
         if not (m.sender == "ai" and m.content in handoff_messages)
     ]
     history = history[-settings.history_limit :]
-    initial = {"question": body.content, "history": history, "tenant_id": tenant_id}
+    generation_rows = await db.execute(
+        select(Document.id, Document.active_generation).where(
+            Document.tenant_id == tenant_id,
+            Document.deleted_at.is_(None),
+        )
+    )
+    active_generations = {
+        row.id: row.active_generation for row in generation_rows.all()
+    }
+    initial = {
+        "question": body.content,
+        "history": history,
+        "tenant_id": tenant_id,
+        "active_generations": active_generations,
+    }
 
     async def event_stream():
         started_at = perf_counter()

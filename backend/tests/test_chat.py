@@ -80,7 +80,7 @@ async def test_chat_only_sends_latest_six_messages_to_model(client, monkeypatch)
     conversation_id = await create_conversation(client, headers)
     monkeypatch.setattr(settings, "history_limit", 6, raising=False)
 
-    async def retrieve(tenant_id, question):
+    async def retrieve(tenant_id, question, active_generations):
         return [Hit("doc", "help.txt", 0, "Address update instructions.", 0.9)]
 
     monkeypatch.setattr(nodes, "retrieve", retrieve)

@@ -66,32 +66,47 @@ async def create_conversation(client, headers):
 
 
 def install_fake_store(monkeypatch):
-    knowledge: dict[str, list[Hit]] = {}
+    knowledge: dict[str, list[tuple[uuid.UUID, Hit]]] = {}
 
-    async def upsert_chunks(tenant_id, document_id, filename, chunks, vectors):
+    async def upsert_generation(tenant_id, document_id, generation_id, filename, chunks, vectors):
         knowledge.setdefault(str(tenant_id), []).extend(
             [
-                Hit(str(document_id), filename, i, text, 0.99)
+                (generation_id, Hit(str(document_id), filename, i, text, 0.99))
                 for i, text in enumerate(chunks)
             ]
         )
 
-    async def search(tenant_id, vector, limit, min_score):
-        return knowledge.get(str(tenant_id), [])[:limit]
+    async def search(tenant_id, vector, limit, min_score, active_generations):
+        return [
+            hit
+            for generation_id, hit in knowledge.get(str(tenant_id), [])
+            if active_generations.get(uuid.UUID(hit.document_id)) == generation_id
+        ][:limit]
+
+    async def delete_generation(tenant_id, document_id, generation_id):
+        rows = knowledge.get(str(tenant_id), [])
+        knowledge[str(tenant_id)] = [
+            (row_generation, hit)
+            for row_generation, hit in rows
+            if hit.document_id != str(document_id) or row_generation != generation_id
+        ]
 
     async def delete_document(tenant_id, document_id):
         rows = knowledge.get(str(tenant_id), [])
         knowledge[str(tenant_id)] = [
-            hit for hit in rows if hit.document_id != str(document_id)
+            (generation_id, hit)
+            for generation_id, hit in rows
+            if hit.document_id != str(document_id)
         ]
 
-    monkeypatch.setattr(store, "upsert_chunks", upsert_chunks)
+    monkeypatch.setattr(store, "upsert_generation", upsert_generation)
     monkeypatch.setattr(store, "search", search)
+    monkeypatch.setattr(store, "delete_generation", delete_generation)
     monkeypatch.setattr(store, "delete_document", delete_document)
     return knowledge
 
 
-async def test_upload_then_list_shows_ready_document_with_chunks(client, monkeypatch):
+async def test_upload_then_list_shows_ready_document_with_chunks(client, monkeypatch, drain_jobs):
     install_fake_store(monkeypatch)
     headers = await register(client, "Acme", "owner@acme.com")
 
@@ -102,6 +117,8 @@ async def test_upload_then_list_shows_ready_document_with_chunks(client, monkeyp
     )
 
     assert uploaded.status_code == 202
+    assert uploaded.json()["status"] == "queued"
+    await drain_jobs()
     listed = await client.get("/api/v1/documents", headers=headers)
     assert listed.status_code == 200
     assert len(listed.json()) == 1
@@ -146,7 +163,7 @@ async def test_agent_cannot_upload_document(client):
     assert response.status_code == 403
 
 
-async def test_uploaded_document_returns_citation_event(client, monkeypatch):
+async def test_uploaded_document_returns_citation_event(client, monkeypatch, drain_jobs):
     install_fake_store(monkeypatch)
     headers = await register(client, "Acme", "owner@acme.com")
     conversation_id = await create_conversation(client, headers)
@@ -156,6 +173,7 @@ async def test_uploaded_document_returns_citation_event(client, monkeypatch):
         files={"file": ("support-guide.txt", b"Our refund code is ACME-42.", "text/plain")},
     )
     assert uploaded.status_code == 202
+    await drain_jobs()
     monkeypatch.setitem(app.dependency_overrides, get_llm, FakeProvider)
 
     response = await client.post(
@@ -169,7 +187,7 @@ async def test_uploaded_document_returns_citation_event(client, monkeypatch):
     assert "support-guide.txt" in response.text
 
 
-async def test_other_company_gets_no_citations(client, monkeypatch):
+async def test_other_company_gets_no_citations(client, monkeypatch, drain_jobs):
     install_fake_store(monkeypatch)
     headers_a = await register(client, "Acme", "owner@acme.com")
     headers_b = await register(client, "Globex", "owner@globex.com")
@@ -180,6 +198,7 @@ async def test_other_company_gets_no_citations(client, monkeypatch):
         files={"file": ("acme-private.txt", b"The Acme launch password is orbit.", "text/plain")},
     )
     assert uploaded.status_code == 202
+    await drain_jobs()
     monkeypatch.setitem(app.dependency_overrides, get_llm, FakeProvider)
 
     response = await client.post(
@@ -193,7 +212,7 @@ async def test_other_company_gets_no_citations(client, monkeypatch):
     assert "acme-private.txt" not in response.text
 
 
-async def test_deleting_document_removes_knowledge(client, monkeypatch):
+async def test_deleting_document_removes_knowledge(client, monkeypatch, drain_jobs):
     install_fake_store(monkeypatch)
     headers = await register(client, "Acme", "owner@acme.com")
     conversation_id = await create_conversation(client, headers)
@@ -203,6 +222,7 @@ async def test_deleting_document_removes_knowledge(client, monkeypatch):
         files={"file": ("delete-me.txt", b"The secret product code is PURPLE.", "text/plain")},
     )
     assert uploaded.status_code == 202
+    await drain_jobs()
     document_id = (await client.get("/api/v1/documents", headers=headers)).json()[0]["id"]
     monkeypatch.setitem(app.dependency_overrides, get_llm, FakeProvider)
 
@@ -334,14 +354,15 @@ async def test_delete_removes_vectors_and_object(client, fake_storage, monkeypat
         doc = await db.scalar(select(Document))
     removed = []
 
-    async def fake_delete_vectors(tenant_id, document_id):
-        removed.append((tenant_id, document_id))
+    async def fake_delete_vectors(tenant_id, document_id, generation_id):
+        removed.append((tenant_id, document_id, generation_id))
 
     monkeypatch.setattr(storage_mod, "get_storage", lambda: fake_storage)
-    monkeypatch.setattr(store, "delete_document", fake_delete_vectors)
+    monkeypatch.setattr(store, "delete_generation", fake_delete_vectors)
     response = await client.delete(f"/api/v1/documents/{doc.id}", headers=headers)
     assert response.status_code == 204
-    assert removed == [(doc.tenant_id, doc.id)]
+    assert len(removed) == 1
+    assert removed[0][:2] == (doc.tenant_id, doc.id)
     assert await fake_storage.exists(doc.storage_key) is False
 
 
@@ -394,22 +415,25 @@ async def test_delete_storage_failure_does_not_block_row_deletion(client, monkey
     async with SessionLocal() as db:
         doc = await db.scalar(select(Document))
 
+    storage = storage_mod.get_storage()
+    original_delete = storage.delete
+
     async def fail_delete(key):
         raise StorageError("storage unavailable")
 
-    monkeypatch.setattr(storage_mod.get_storage(), "delete", fail_delete)
+    monkeypatch.setattr(storage, "delete", fail_delete)
     response = await client.delete(f"/api/v1/documents/{doc.id}", headers=headers)
     assert response.status_code == 204
     async with SessionLocal() as db:
+        pending = await db.get(Document, doc.id)
+        assert pending is not None
+        assert pending.deleted_at is not None
+    monkeypatch.setattr(storage, "delete", original_delete)
+    from app.jobs.cleanup import cleanup_deleted_documents_once
+
+    assert await cleanup_deleted_documents_once(document_id=doc.id, tenant_id=doc.tenant_id) == 1
+    async with SessionLocal() as db:
         assert await db.get(Document, doc.id) is None
-
-
-class _Background:
-    def __init__(self):
-        self.tasks = []
-
-    def add_task(self, func, *args, **kwargs):
-        self.tasks.append((func, args, kwargs))
 
 
 @pytest.mark.parametrize("failure_stage", ["insert", "commit"])
@@ -432,9 +456,8 @@ async def test_database_failure_compensates_uploaded_object(failure_stage, fake_
     with pytest.raises(RuntimeError) as exc:
         await documents_route.upload_document(
             upload,
-            _Background(),
-            SimpleNamespace(tenant_id=uuid.uuid4()),
-            FailingDb(),
+            user=SimpleNamespace(tenant_id=uuid.uuid4()),
+            db=FailingDb(),
         )
     assert exc.value is db_error
     assert fake_storage.objects == {}
@@ -461,8 +484,7 @@ async def test_cleanup_failure_preserves_database_exception(fake_storage, monkey
     with pytest.raises(RuntimeError) as exc:
         await documents_route.upload_document(
             upload,
-            _Background(),
-            SimpleNamespace(tenant_id=uuid.uuid4()),
-            FailingDb(),
+            user=SimpleNamespace(tenant_id=uuid.uuid4()),
+            db=FailingDb(),
         )
     assert exc.value is db_error

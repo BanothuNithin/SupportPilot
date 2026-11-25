@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_bucket: str = "supportpilot-docs"
     s3_region: str = "us-east-1"
+    job_max_attempts: int = 3
+    job_lease_seconds: int = 300
+    job_requeue_after_seconds: int = 60
+    reconcile_interval_seconds: int = 30
+    worker_concurrency: int = 4
 
 
 settings = Settings()

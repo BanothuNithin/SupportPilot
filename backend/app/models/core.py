@@ -7,7 +7,18 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, Uuid, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    Uuid,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -106,10 +117,53 @@ class Document(Base):
     storage_key: Mapped[str] = mapped_column(String(500))  # S3/MinIO key
     content_type: Mapped[str | None] = mapped_column(String(100))
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    status: Mapped[str] = mapped_column(String(20), default="uploaded")  # uploaded | indexing | ready | failed
+    status: Mapped[str] = mapped_column(String(20), default="queued")  # queued | indexing | ready | failed
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_now,
+        onupdate=_now,
+        server_default=func.now(),
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    active_generation: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     chunk_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("ix_documents_status_updated_at", "status", "updated_at"),
+    )
+
+
+class DocumentIndexGeneration(Base):
+    """Durable lifecycle record for one isolated Qdrant index generation."""
+
+    __tablename__ = "document_index_generations"
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    generation_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    status: Mapped[str] = mapped_column(String(20))
+    is_legacy: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_now,
+        onupdate=_now,
+        server_default=func.now(),
+    )
+    cleanup_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    cleanup_passes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+    __table_args__ = (
+        Index("ix_document_generations_cleanup", "status", "cleanup_after"),
+        Index("ix_document_generations_document", "tenant_id", "document_id"),
+    )
 
 
 class Integration(Base):

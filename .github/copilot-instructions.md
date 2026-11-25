@@ -55,15 +55,11 @@ Multi-tenant agentic AI customer-support platform. Backend: FastAPI (async), SQL
 - Minimal diffs. No unrelated refactors. Do not touch files outside the task's list.
 - At the end: run the relevant whole suite, show `git diff --stat`, and list anything suspicious you noticed but did not change.
 
-## Week 6 target conventions (jobs, storage, RLS)
+## Week 6 conventions (partial implementation)
 
-These are the target architecture for Week 6. They are not yet implemented in the repository:
-- There is no `app/worker.py`, `app/storage.py`, or current boto3/S3 dependency.
-- Document uploads still use FastAPI `BackgroundTasks` and `app/rag/ingest.py`; there is no Redis job queue or document reconciler.
-- Approved actions still execute in `backend/app/api/routes/actions.py` inside the HTTP request; there is no worker or at-most-once side-effect queue.
-- PostgreSQL RLS, `app_user`, `after_begin` tenant-context setup, `system_scope()`, and RLS migrations are not present.
+Document storage and indexing jobs are implemented: uploads use S3-compatible storage, Redis is a best-effort wake-up queue, `app/worker.py` claims and indexes queued documents, and the reconciler repairs stuck document jobs. Approved actions still execute in `backend/app/api/routes/actions.py` inside the HTTP request; there is no worker or at-most-once side-effect queue. PostgreSQL RLS, `app_user`, `after_begin` tenant-context setup, `system_scope()`, and RLS migrations are not present.
 
-When implementing Week 6, follow these conventions:
+Continue following these conventions when extending the system:
 - Source of truth is PostgreSQL. Redis jobs are wake-up hints only. A job message is {"type","id","tenant_id"}. Handlers reload the row, never trust the payload, and claim work with an atomic UPDATE ... WHERE status = <expected> (compare-and-set). Every job type has a reconciler rule that repairs stuck rows from database state alone.
 - Delivery semantics: idempotent jobs (document indexing) are at-least-once and may be retried automatically. Jobs with external side effects (GitHub, Slack) are at-most-once: if the outcome is unknown the action becomes failed with a message saying so, and a human decides about a retry. Never auto-retry a side effect after it may have been sent.
 - Worker: `python -m app.worker`, plain asyncio, no signal handlers (Windows dev). Ctrl+C is a graceful stop. Handlers are plain async functions callable directly from tests. Logs contain job type, id, duration and outcome, never payload content, filenames or secrets.

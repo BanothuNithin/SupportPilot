@@ -1,4 +1,4 @@
-# Architecture (Week 5)
+# Architecture (Week 6)
 
 Solid boxes are built. Dashed boxes are planned (week in brackets).
 
@@ -8,14 +8,15 @@ flowchart TD
     API["FastAPI: auth, RBAC, tenant-scoped APIs, SSE and persistence"]:::done
     AG["LangGraph support workflow: rule triage, grader, resolver, escalation"]:::done
     RAG["Query cleanup, follow-up expansion, embeddings and prompt assembly"]:::done
-    QD[("Qdrant: chunks, tenant-filtered search")]:::done
+    QD[("Qdrant: tenant- and generation-filtered chunks")]:::done
     LLM["OpenAI-compatible LLM provider (Ollama in local setup)"]:::done
     MCP["Custom MCP stdio server: create_github_issue, post_slack_alert"]:::done
     GH["GitHub Issues API"]:::done
     SL["Slack incoming webhook"]:::done
-    PG[("PostgreSQL: tickets, messages, encrypted integrations, pending actions")]:::done
+    PG[("PostgreSQL: documents, index generations, tickets and application data")]:::done
     RD[("Redis: refresh tokens, rate limits, tenant-scoped pub/sub")]:::done
-    S3[("MinIO / S3 (Week 6)")]:::planned
+    WK["Document indexing worker and database reconciler"]:::done
+    S3[("S3-compatible document storage")]:::done
     OBS["Langfuse + RAGAS (Week 7)"]:::planned
 
     UI --> API
@@ -26,10 +27,14 @@ flowchart TD
     AG --> LLM
     API --> PG
     API --> RD
+    API --> S3
+    RD --> WK
+    WK --> PG
+    WK --> S3
+    WK --> QD
     API -->|"approved action: spawn process; credentials in environment"| MCP
     MCP --> GH
     MCP --> SL
-    RAG -.-> S3
     AG -.-> OBS
 
     classDef done fill:#14532d,stroke:#4ade80,color:#ffffff;
@@ -40,7 +45,7 @@ flowchart TD
 1. FastAPI verifies the token, resolves the tenant, saves the customer message, and loads recent conversation history. Exact stored handoff responses are excluded before the latest six messages are passed to the graph.
 2. The triage node uses deterministic rules, not an LLM. A detected human request goes directly to escalation; greetings and supported assistant-meta questions go directly to resolution without retrieval.
 3. Other support messages are cleaned for search. Genuine follow-ups are expanded with the most recent prior user question; the original message and conversation wording remain the input to answer generation.
-4. Retrieval embeds the search query and searches Qdrant with the mandatory tenant filter and configured score threshold.
+4. Retrieval loads the tenant's active document generations from PostgreSQL, then searches Qdrant with tenant and document/generation filters plus the configured score threshold. Documents without a published generation can still use legacy generation-less vectors.
 5. If there are hits, the grader makes a short JSON completion to judge whether the context answers the query. If there are no hits, grading is skipped and the question is not considered grounded.
 6. The decide node routes a grounded answer to resolution; no-reliable-answer, low-confidence, and customer-requested-human outcomes go to escalation.
 7. Grounded resolution emits citations and streams an answer. Escalation streams the configured handoff text and persists a support ticket; it does not itself contact or notify a human.
@@ -131,29 +136,43 @@ sequenceDiagram
     participant U as Owner or Admin
     participant A as FastAPI
     participant D as PostgreSQL
-    participant B as BackgroundTask
+    participant R as Redis queue
+    participant W as Indexing worker
+    participant RC as Reconciler
     participant X as Extractor
     participant C as Chunker
     participant E as Embedder
     participant Q as Qdrant
     U->>A: POST /api/v1/documents (file)
-    A->>D: Create document with status indexing
+    A->>D: Create document with status queued
+    A->>R: Best-effort enqueue hint
     A-->>U: 202 Accepted
-    A-)B: Schedule index_document
-    B->>X: Extract text (pypdf for PDF)
-    X-->>B: Text
-    B->>C: Split paragraphs (800 chars, 100 overlap)
-    C-->>B: Chunks
-    B->>E: Embed chunks
-    E-->>B: Vectors
-    B->>Q: Upsert chunks with tenant_id payload
-    Q-->>B: Stored
+    W->>D: Atomic queued-to-indexing claim with fresh UUID token and lease
+    W->>X: Load stored bytes and extract text
+    X-->>W: Text
+    W->>C: Split paragraphs (800 chars, 100 overlap)
+    C-->>W: Chunks
+    W->>E: Embed chunks; renew lease while processing
+    E-->>W: Vectors
+    W->>Q: Upsert deterministic points for claim-token generation
+    Q-->>W: Write acknowledged
     alt Indexing succeeds
-        B->>D: Set status ready and chunk_count
+        W->>D: Publish active_generation only if token and lease still match
+        Note over D,Q: Previous generation stays searchable until publication commits
     else Indexing fails
-        B->>D: Set status failed and error
+        W->>D: Set retry/failed only if token and lease still match; retain active_generation
     end
+    RC->>D: Find queued work and expired leases
+    RC->>D: Requeue/fail expired claims; mark abandoned generations
+    RC->>R: Best-effort enqueue recovered work
+    RC->>Q: Retry tenant/document/generation-specific cleanup
+    U->>A: DELETE /api/v1/documents/{id}
+    A->>D: Tombstone document and clear active_generation
+    A->>Q: Best-effort cleanup; retries remain in PostgreSQL
+    A->>S3: Best-effort object cleanup; retries remain in PostgreSQL
 ```
+
+Each claim UUID is also its isolated Qdrant generation ID. Generation-specific point IDs prevent concurrent attempts from overwriting one another. Retrieval trusts only the generation pointer committed in PostgreSQL; staging, retired, abandoned, and late-arriving points are invisible. Retired and abandoned generation records are retained and swept repeatedly so a delayed Qdrant write can be removed by a later cleanup pass. Deleted documents remain tombstoned until initial vector and object cleanup succeeds; their generation ledger remains for later cleanup passes.
 
 ## Answering a question (built)
 ```mermaid
@@ -302,8 +321,20 @@ erDiagram
         uuid tenant_id FK
         string filename
         string status
+        uuid active_generation
+        datetime deleted_at
         int chunk_count
         text error
+    }
+    DOCUMENT_INDEX_GENERATIONS {
+        uuid tenant_id FK
+        uuid document_id
+        uuid generation_id
+        string status
+        boolean is_legacy
+        datetime cleanup_after
+        int cleanup_attempts
+        int cleanup_passes
     }
 ```
 

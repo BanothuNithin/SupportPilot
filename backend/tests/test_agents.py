@@ -133,7 +133,7 @@ async def create_conversation(client, headers: dict[str, str]) -> str:
 
 
 def use_empty_retrieval(monkeypatch):
-    async def empty_retrieve(tenant_id, question):
+    async def empty_retrieve(tenant_id, question, active_generations):
         return []
 
     monkeypatch.setattr(nodes, "retrieve", empty_retrieve)
@@ -276,7 +276,7 @@ async def test_retrieve_and_grade_nodes_use_search_query(monkeypatch):
     hit = Hit("doc", "help.txt", 0, "Use the password reset link.", 0.9)
     retrieved_queries = []
 
-    async def retrieve(tenant, query):
+    async def retrieve(tenant, query, active_generations):
         retrieved_queries.append(query)
         return [hit]
 
@@ -323,7 +323,7 @@ async def test_near_miss_escalates_without_citations_or_model_stream(client, mon
         score=0.99,
     )
 
-    async def retrieve_near_miss(tenant_id, question):
+    async def retrieve_near_miss(tenant_id, question, active_generations):
         return [hit]
 
     monkeypatch.setattr(nodes, "retrieve", retrieve_near_miss)
@@ -361,27 +361,34 @@ async def test_near_miss_escalates_without_citations_or_model_stream(client, mon
 
 
 async def test_grounded_answer_receives_real_rule_when_grader_selects_decoy(
-    client, monkeypatch
+    client, monkeypatch, drain_jobs
 ):
     headers = await register(client, "Acme", "owner@acme.com")
     conversation_id = await create_conversation(client, headers)
     monkeypatch.setattr(settings, "embed_provider", "fake")
     monkeypatch.setattr(settings, "rag_top_k", 4)
 
-    indexed: dict[str, list[Hit]] = {}
+    indexed: dict[str, list[tuple[uuid.UUID, Hit]]] = {}
 
-    async def index_chunks(tenant_id, document_id, filename, chunks, vectors):
+    async def index_chunks(tenant_id, document_id, generation_id, filename, chunks, vectors):
         indexed.setdefault(str(tenant_id), []).extend(
             [
-                Hit(str(document_id), filename, index, text, 0.99 - index * 0.01)
+                (
+                    generation_id,
+                    Hit(str(document_id), filename, index, text, 0.99 - index * 0.01),
+                )
                 for index, text in enumerate(chunks)
             ]
         )
 
-    async def retrieve_chunks(tenant_id, vector, limit, min_score):
-        return indexed.get(str(tenant_id), [])[:limit]
+    async def retrieve_chunks(tenant_id, vector, limit, min_score, active_generations):
+        return [
+            hit
+            for generation_id, hit in indexed.get(str(tenant_id), [])
+            if active_generations.get(uuid.UUID(hit.document_id)) == generation_id
+        ][:limit]
 
-    monkeypatch.setattr(store, "upsert_chunks", index_chunks)
+    monkeypatch.setattr(store, "upsert_generation", index_chunks)
     monkeypatch.setattr(store, "search", retrieve_chunks)
 
     question = (
@@ -414,6 +421,7 @@ async def test_grounded_answer_receives_real_rule_when_grader_selects_decoy(
             files={"file": (filename, text.encode(), "text/plain")},
         )
         assert uploaded.status_code == 202
+    await drain_jobs()
 
     llm = ScriptedFakeLLM(
         grade={"can_answer": True, "used_sources": [1], "confidence": 1.0},
@@ -451,20 +459,20 @@ async def test_grounded_answer_receives_real_rule_when_grader_selects_decoy(
 
 
 async def test_followup_retrieves_with_first_question_after_document_upload(
-    client, monkeypatch
+    client, monkeypatch, drain_jobs
 ):
     headers = await register(client, "Acme", "owner@acme.com")
     conversation_id = await create_conversation(client, headers)
     monkeypatch.setattr(settings, "embed_provider", "fake")
-    indexed: list[Hit] = []
+    indexed: list[tuple[uuid.UUID, Hit]] = []
 
-    async def index_chunks(tenant_id, document_id, filename, chunks, vectors):
+    async def index_chunks(tenant_id, document_id, generation_id, filename, chunks, vectors):
         indexed.extend(
-            Hit(str(document_id), filename, index, text, 0.99)
+            (generation_id, Hit(str(document_id), filename, index, text, 0.99))
             for index, text in enumerate(chunks)
         )
 
-    monkeypatch.setattr(store, "upsert_chunks", index_chunks)
+    monkeypatch.setattr(store, "upsert_generation", index_chunks)
     uploaded = await client.post(
         "/api/v1/documents",
         headers=headers,
@@ -477,14 +485,19 @@ async def test_followup_retrieves_with_first_question_after_document_upload(
         },
     )
     assert uploaded.status_code == 202
+    await drain_jobs()
     assert indexed
 
     queries: list[str] = []
 
-    async def retrieve_uploaded(tenant_id, question):
+    async def retrieve_uploaded(tenant_id, question, active_generations):
         queries.append(question)
         if "proof of address" in question.lower():
-            return indexed[:1]
+            return [
+                hit
+                for generation_id, hit in indexed
+                if active_generations.get(uuid.UUID(hit.document_id)) == generation_id
+            ][:1]
         return []
 
     monkeypatch.setattr(nodes, "retrieve", retrieve_uploaded)
@@ -565,7 +578,7 @@ async def test_human_request_fast_path_skips_llm_and_retrieval(client, monkeypat
     conversation_id = await create_conversation(client, headers)
     retrieval_calls = []
 
-    async def retrieve(tenant_id, question):
+    async def retrieve(tenant_id, question, active_generations):
         retrieval_calls.append(question)
         return []
 
@@ -599,7 +612,7 @@ async def test_model_human_request_for_greeting_does_not_escalate(client, monkey
     conversation_id = await create_conversation(client, headers)
     retrieval_calls = []
 
-    async def retrieve(tenant_id, question):
+    async def retrieve(tenant_id, question, active_generations):
         retrieval_calls.append(question)
         return []
 

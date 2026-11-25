@@ -1,3 +1,4 @@
+import uuid
 from typing import Literal, TypedDict
 
 from pydantic import BaseModel, field_validator
@@ -31,6 +32,7 @@ class State(TypedDict, total=False):
     question: str
     history: list[dict]
     tenant_id: object  # uuid.UUID
+    active_generations: dict[uuid.UUID, uuid.UUID | None]
     search_query: str
     # produced by nodes
     triage: Triage

@@ -61,7 +61,7 @@ Most AI support bots only answer questions. Real support needs three more things
 | RAG | Qdrant, embeddings, citations | Done |
 | Agents | LangGraph rule-based triage, retrieval, grader, resolver and escalation; OpenAI-compatible model provider/router | Built |
 | Tools | Custom MCP stdio server using official Python SDK `mcp~=1.30.0` (GitHub issues and Slack alerts), allow-listed tools, human approval | Built |
-| Storage and workers | MinIO / S3, background jobs | Week 6 |
+| Storage and workers | S3-compatible object storage, Redis wake-up queue, indexing worker and reconciler | Built |
 | Observability | Langfuse, RAGAS evals in CI | Week 7 |
 | Deployment | Kubernetes, Terraform | Week 8 |
 
@@ -159,21 +159,24 @@ Base path `/api/v1`
 | `POST /actions/{id}/reject` | Reject a pending proposal | Owner, Admin |
 | `POST /documents` | Upload a `.txt`, `.md` or `.pdf` for indexing (returns 202; agents get 403) | Owner, Admin |
 | `GET /documents` | List this tenant's documents | Authenticated |
+| `GET /documents/{id}/download` | Download a tenant-scoped original file | Authenticated |
+| `POST /documents/{id}/reindex` | Queue a ready or failed document for reindexing | Owner, Admin |
 | `DELETE /documents/{id}` | Delete a tenant document and its vectors (agents get 403) | Owner, Admin |
 
 <!-- Add your own screenshot: Swagger showing the 403 for an agent calling POST /auth/users -->
 <!-- ![RBAC in action](docs/images/swagger-403.png) -->
 
 ## Known limitations
-- Original files are not stored; only text chunks are retained. Object storage is planned for Week 6.
-- Indexing runs as a FastAPI BackgroundTask. A server restart during indexing can leave a document in `indexing`; a job queue is planned for Week 6.
+- Original files are stored in S3-compatible object storage. Deployments must configure and run the storage service.
+- Document indexing uses Redis as a best-effort wake-up queue and database status as the source of truth; run `python -m app.worker` separately from the API.
+- PostgreSQL row-level security is not implemented yet.
 - Scanned PDFs are not OCR-processed and fail with a clear error.
 - Search is dense-only; keyword matching and reranking are not implemented.
 - The 0.35 score threshold is an initial guess, not tuned. Further evaluation: TBD (Week 7 evals).
 - Rule-based triage is intentionally conservative and may need tuning as real support language is observed.
 - The answerability grader is still an LLM judgment; if grading fails, the current implementation falls back to the top retrieval score.
 - The search-query cleaner and follow-up detector use rules, so unusual phrasing may not be normalized or expanded as intended.
-- Approved actions execute inside the HTTP request; there is no worker or retry queue yet (planned for Week 6). A process crash after an action is marked approved but before it is marked executed can leave it approved.
+- Approved actions execute inside the HTTP request; there is no worker or retry queue for external side effects. A process crash after an action is marked approved but before it is marked executed can leave it approved.
 - Each approved action starts a separate MCP subprocess; there is no process pool.
 - Each tenant can configure one GitHub repository and one Slack webhook/channel.
 - Redis pub/sub is fire-and-forget and has no event replay. The frontend refetches conversation messages after reconnecting.
@@ -189,7 +192,7 @@ Base path `/api/v1`
 | 3 | RAG ingestion, Qdrant, citations (done) |
 | 4 | LangGraph support workflow, deterministic triage and fast paths, follow-up-aware retrieval, grading, escalation, and streaming observability (done) |
 | 5 | Per-tenant GitHub and Slack integrations, MCP tools, approval-gated actions, staff replies and live conversation updates (done) |
-| 6 | Redis workers, S3, Postgres Row-Level Security |
+| 6 | Document indexing worker and S3 storage (done); PostgreSQL Row-Level Security (remaining) |
 | 7 | Langfuse, RAGAS evals in CI, load tests |
 | 8 | Kubernetes, Terraform, live deployment |
 

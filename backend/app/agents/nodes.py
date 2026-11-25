@@ -38,7 +38,11 @@ async def triage_node(state: State, config: RunnableConfig) -> dict:
 async def retrieve_node(state: State, config: RunnableConfig) -> dict:
     query = build_search_query(state["question"], state.get("history", []))
     return {
-        "hits": await retrieve(state["tenant_id"], query),
+        "hits": await retrieve(
+            state["tenant_id"],
+            query,
+            state.get("active_generations", {}),
+        ),
         "search_query": query,
     }
 

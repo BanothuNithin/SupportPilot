@@ -15,6 +15,11 @@ os.environ["S3_ACCESS_KEY"] = "test-access"
 os.environ["S3_SECRET_KEY"] = "test-secret"
 os.environ["S3_BUCKET"] = "supportpilot-test"
 os.environ["S3_REGION"] = "us-east-1"
+os.environ["JOB_MAX_ATTEMPTS"] = "3"
+os.environ["JOB_LEASE_SECONDS"] = "300"
+os.environ["JOB_REQUEUE_AFTER_SECONDS"] = "1"
+os.environ["RECONCILE_INTERVAL_SECONDS"] = "30"
+os.environ["WORKER_CONCURRENCY"] = "4"
 
 import fakeredis.aioredis  # noqa: E402
 import app.core.redis as redis_mod  # noqa: E402
@@ -54,3 +59,22 @@ async def fake_storage(monkeypatch):
     storage = FakeStorage()
     monkeypatch.setattr(storage_mod, "_storage", storage)
     yield storage
+
+
+@pytest_asyncio.fixture
+async def drain_jobs():
+    async def drain():
+        from app.jobs.queue import dequeue
+        from app.worker import handlers
+
+        count = 0
+        while True:
+            job = await dequeue(1)
+            if job is None:
+                return count
+            handler = handlers.get(job.get("type"))
+            if handler is not None:
+                await handler(job["id"], job["tenant_id"])
+                count += 1
+
+    return drain
