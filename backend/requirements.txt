@@ -19,3 +19,5 @@ pypdf>=5.0
 langgraph>=1.0
 cryptography>=43
 mcp~=1.30.0
+boto3>=1.35
+moto[s3]>=5.0

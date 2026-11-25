@@ -104,6 +104,8 @@ class Document(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), index=True)
     filename: Mapped[str] = mapped_column(String(255))
     storage_key: Mapped[str] = mapped_column(String(500))  # S3/MinIO key
+    content_type: Mapped[str | None] = mapped_column(String(100))
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     status: Mapped[str] = mapped_column(String(20), default="uploaded")  # uploaded | indexing | ready | failed
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")

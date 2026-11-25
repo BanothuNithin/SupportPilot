@@ -1,7 +1,10 @@
 import os
 import uuid
+import logging
+from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, status
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,8 +17,33 @@ from app.rag import store
 from app.rag.extract import ALLOWED_EXTENSIONS
 from app.rag.ingest import index_document
 from app.schemas.document import DocumentOut
+from app.storage import get_storage, StorageError
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+log = logging.getLogger(__name__)
+
+
+def sanitize_filename(filename: str) -> str:
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if ch.isprintable() and ord(ch) >= 32)
+    name = name.strip()
+    return (name or "document")[:200]
+
+
+def content_type_for(ext: str) -> str:
+    return {
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+    }.get(ext, "application/octet-stream")
+
+
+def attachment_header(filename: str) -> str:
+    ascii_name = filename.encode("ascii", "replace").decode("ascii")
+    ascii_name = ascii_name.replace("\\", "_").replace('"', "_").replace("/", "_")
+    ascii_name = "".join(ch for ch in ascii_name if ch not in "\r\n")
+    encoded_name = quote(filename, safe="")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
 
 
 @router.post("", response_model=DocumentOut, status_code=202)
@@ -25,7 +53,7 @@ async def upload_document(
     user: User = Depends(require_roles(Role.owner, Role.admin)),
     db: AsyncSession = Depends(get_db),
 ):
-    filename = os.path.basename(file.filename or "")
+    filename = sanitize_filename(file.filename or "")
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Only .txt, .md and .pdf files are supported")
@@ -34,11 +62,49 @@ async def upload_document(
         raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "File is too large")
     if not data.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "File is empty")
+    if ext == ".pdf" and not data.startswith(b"%PDF-"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid PDF file")
+    if ext in {".txt", ".md"}:
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Text file must be valid UTF-8")
+        if b"\x00" in data:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Text file contains a NUL byte")
 
-    doc = Document(tenant_id=user.tenant_id, filename=filename, storage_key="", status="indexing")
-    db.add(doc)
-    await db.commit()
-    background.add_task(index_document, doc.id, user.tenant_id, filename, data)
+    document_id = uuid.uuid4()
+    key = f"tenants/{user.tenant_id}/documents/{document_id}/{uuid.uuid4().hex}{ext}"
+    content_type = content_type_for(ext)
+    try:
+        await get_storage().put(key, data, content_type)
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Object storage unavailable",
+        ) from exc
+    doc = Document(
+        id=document_id,
+        tenant_id=user.tenant_id,
+        filename=filename,
+        storage_key=key,
+        content_type=content_type,
+        size_bytes=len(data),
+        status="indexing",
+    )
+    try:
+        db.add(doc)
+        await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            log.warning("database rollback failed after uploaded document failure")
+        try:
+            await get_storage().delete(key)
+        except Exception:
+            log.warning("uploaded document cleanup failed")
+        raise
+    background.add_task(index_document, doc.id, user.tenant_id)
     return doc
 
 
@@ -56,5 +122,40 @@ async def delete_document(
 ):
     doc = await get_owned(db, Document, document_id, user.tenant_id)
     await store.delete_document(user.tenant_id, doc.id)
+    if doc.storage_key:
+        try:
+            await get_storage().delete(doc.storage_key)
+        except Exception:
+            log.warning("document object cleanup failed document_id=%s", doc.id)
     await db.delete(doc)
     await db.commit()
+
+
+@router.get("/{document_id}/download")
+async def download_document(
+    document_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    doc = await get_owned(db, Document, document_id, user.tenant_id)
+    if not doc.storage_key:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document object is unavailable")
+    try:
+        data = await get_storage().get(doc.storage_key)
+    except FileNotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document object not found")
+    except StorageError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Object storage unavailable")
+    media_type = doc.content_type if doc.content_type in {
+        "application/pdf",
+        "text/plain",
+        "text/markdown",
+    } else "application/octet-stream"
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": attachment_header(doc.filename),
+        },
+    )

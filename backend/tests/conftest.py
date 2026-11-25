@@ -10,9 +10,15 @@ os.environ["INTEGRATIONS_KEY"] = "wvyzx2-IJJG-H42krUEt_EDr8IJhsVQ23o_gdCwEeNU="
 os.environ["LLM_PROVIDER"] = "fake"
 os.environ["EMBED_PROVIDER"] = "fake"
 os.environ["QDRANT_URL"] = ":memory:"
+os.environ["S3_ENDPOINT"] = ""
+os.environ["S3_ACCESS_KEY"] = "test-access"
+os.environ["S3_SECRET_KEY"] = "test-secret"
+os.environ["S3_BUCKET"] = "supportpilot-test"
+os.environ["S3_REGION"] = "us-east-1"
 
 import fakeredis.aioredis  # noqa: E402
 import app.core.redis as redis_mod  # noqa: E402
+import app.storage as storage_mod  # noqa: E402
 
 
 import pytest_asyncio  # noqa: E402
@@ -39,3 +45,12 @@ async def client():
 @pytest_asyncio.fixture(autouse=True)
 async def fake_redis(monkeypatch):
     monkeypatch.setattr(redis_mod, "redis_client", fakeredis.aioredis.FakeRedis(decode_responses=True))
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def fake_storage(monkeypatch):
+    from app.storage import FakeStorage
+
+    storage = FakeStorage()
+    monkeypatch.setattr(storage_mod, "_storage", storage)
+    yield storage

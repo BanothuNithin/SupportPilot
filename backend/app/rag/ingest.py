@@ -7,6 +7,7 @@ from app.rag import store
 from app.rag.chunking import chunk_text
 from app.rag.embeddings import get_embedder
 from app.rag.extract import IngestError, extract_text
+from app.storage import get_storage
 
 log = logging.getLogger(__name__)
 EMBED_BATCH = 32
@@ -20,10 +21,15 @@ async def _finish(doc_id: uuid.UUID, status: str, chunk_count: int = 0, error: s
             await db.commit()
 
 
-async def index_document(doc_id: uuid.UUID, tenant_id: uuid.UUID, filename: str, data: bytes) -> None:
-    """Background job: extract text, chunk, embed, store vectors, update the document status.
-    Runs after the HTTP response, so it opens its own DB session. (Week 6 moves this to a real worker queue.)"""
+async def index_document(doc_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
+    """Background indexing job; reloads document metadata and reads bytes from storage."""
     try:
+        async with SessionLocal() as db:
+            doc = await db.get(Document, doc_id)
+        if doc is None or doc.tenant_id != tenant_id or not doc.storage_key:
+            raise IngestError("Document not found")
+        data = await get_storage().get(doc.storage_key)
+        filename = doc.filename
         text = extract_text(filename, data)
         chunks = chunk_text(text)
         if not chunks:

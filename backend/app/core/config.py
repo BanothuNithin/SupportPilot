@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     github_api_base: str = "https://api.github.com"
     frontend_base_url: str = "http://localhost:3000"
     mcp_timeout_seconds: int = 30
+    s3_endpoint: str = ""
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    s3_bucket: str = "supportpilot-docs"
+    s3_region: str = "us-east-1"
 
 
 settings = Settings()
