@@ -3,10 +3,10 @@
 Multi-tenant agentic AI customer-support platform. Backend: FastAPI (async), SQLAlchemy 2, PostgreSQL, Redis, Qdrant, LangGraph. Frontend: Next.js App Router, TypeScript, Tailwind. Dev on Windows (PowerShell, conda environment "supportpilot", Python 3.12). CI on Linux (GitHub Actions).
 
 ## Layout
-- backend/app/main.py: FastAPI app, CORS for http://localhost:3000, `/api/v1` router registration, logging setup, and the startup lifespan
+- backend/app/main.py: FastAPI app, CORS for http://localhost:3000, `/api/v1` router registration, and logging setup
 - backend/app/api/deps.py: `get_current_user` and `require_roles(*roles)`
 - backend/app/api/tenant.py: `get_owned(db, model, obj_id, tenant_id, *options)` tenant-scoped fetch that raises 404
-- backend/app/api/routes/: `auth`, `customers`, `conversations`, `chat` (SSE streaming), `documents`, and `tickets`
+- backend/app/api/routes/: `auth`, `customers`, `conversations`, `chat` (SSE streaming), `documents`, `tickets`, `integrations`, and `actions`
 - backend/app/core/: Pydantic settings, password/JWT security, call-time Redis access, refresh-token helpers, and login/IP rate limiting
 - backend/app/db/: `Base`, async engine, `SessionLocal`, and `get_db`
 - backend/app/models/core.py: all SQLAlchemy models using `Mapped`/`mapped_column`; `backend/app/schemas/` contains Pydantic request/response schemas
@@ -54,3 +54,19 @@ Multi-tenant agentic AI customer-support platform. Backend: FastAPI (async), SQL
 - Before coding, read the files named in the task and state which conventions you will follow.
 - Minimal diffs. No unrelated refactors. Do not touch files outside the task's list.
 - At the end: run the relevant whole suite, show `git diff --stat`, and list anything suspicious you noticed but did not change.
+
+## Week 6 target conventions (jobs, storage, RLS)
+
+These are the target architecture for Week 6. They are not yet implemented in the repository:
+- There is no `app/worker.py`, `app/storage.py`, or current boto3/S3 dependency.
+- Document uploads still use FastAPI `BackgroundTasks` and `app/rag/ingest.py`; there is no Redis job queue or document reconciler.
+- Approved actions still execute in `backend/app/api/routes/actions.py` inside the HTTP request; there is no worker or at-most-once side-effect queue.
+- PostgreSQL RLS, `app_user`, `after_begin` tenant-context setup, `system_scope()`, and RLS migrations are not present.
+
+When implementing Week 6, follow these conventions:
+- Source of truth is PostgreSQL. Redis jobs are wake-up hints only. A job message is {"type","id","tenant_id"}. Handlers reload the row, never trust the payload, and claim work with an atomic UPDATE ... WHERE status = <expected> (compare-and-set). Every job type has a reconciler rule that repairs stuck rows from database state alone.
+- Delivery semantics: idempotent jobs (document indexing) are at-least-once and may be retried automatically. Jobs with external side effects (GitHub, Slack) are at-most-once: if the outcome is unknown the action becomes failed with a message saying so, and a human decides about a retry. Never auto-retry a side effect after it may have been sent.
+- Worker: `python -m app.worker`, plain asyncio, no signal handlers (Windows dev). Ctrl+C is a graceful stop. Handlers are plain async functions callable directly from tests. Logs contain job type, id, duration and outcome, never payload content, filenames or secrets.
+- Storage: all file I/O goes through app/storage.py (a Storage Protocol; S3Storage uses boto3 inside anyio.to_thread). Object keys are tenants/<tenant_id>/documents/<document_id>/<uuid>.<ext>, never built from the user-supplied filename. Tests use FakeStorage or moto, never a real server. Access the storage instance at call time (module attribute), never import it by name.
+- RLS: every table with a tenant_id has row-level security enabled and forced. The app connects as the non-superuser role app_user. The tenant context is set per transaction with set_config('app.tenant_id', ..., true) from a SQLAlchemy after_begin hook. system_scope() (sets app.system='on') may be used ONLY in: login, register, refresh, the worker's scan queries and the reconciler. Request handlers never use it. New tenant tables MUST get an RLS policy in the same migration. SQLite tests skip RLS; RLS tests run on PostgreSQL (marker postgres).
+- Every new setting (S3, queue, rate limits, cache) is forced to a safe test value in tests/conftest.py before app imports.
