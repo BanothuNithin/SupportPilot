@@ -171,6 +171,7 @@ async def delete_document(
         doc.active_generation = None
         doc.claim_token = None
         doc.locked_until = None
+        doc.cleanup_after = now
         doc.updated_at = now
         for generation in generations:
             if generation.status == "active":

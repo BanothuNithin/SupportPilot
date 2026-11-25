@@ -2,7 +2,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, or_, select, update
 
 from app.core.config import settings
 from app.db.session import SessionLocal
@@ -126,10 +126,16 @@ async def cleanup_deleted_documents_once(
         conditions.append(Document.id == document_id)
     if tenant_id is not None:
         conditions.append(Document.tenant_id == tenant_id)
+    conditions.append(
+        or_(Document.cleanup_after.is_(None), Document.cleanup_after <= now)
+    )
     async with SessionLocal() as db:
         documents = (
             await db.scalars(
-                select(Document).where(*conditions).order_by(Document.deleted_at).limit(limit)
+                select(Document)
+                .where(*conditions)
+                .order_by(func.coalesce(Document.cleanup_after, Document.deleted_at))
+                .limit(limit)
             )
         ).all()
 
@@ -212,4 +218,19 @@ async def cleanup_deleted_documents_once(
                 await db.commit()
             if result.rowcount == 1:
                 deleted += 1
+        else:
+            async with SessionLocal() as db:
+                await db.execute(
+                    update(Document)
+                    .where(
+                        Document.id == document.id,
+                        Document.tenant_id == document.tenant_id,
+                        Document.deleted_at.is_not(None),
+                    )
+                    .values(
+                        cleanup_after=now + _retry_delay(),
+                        updated_at=now,
+                    )
+                )
+                await db.commit()
     return deleted

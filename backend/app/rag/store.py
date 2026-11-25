@@ -24,6 +24,7 @@ class Hit:
     chunk_index: int
     text: str
     score: float
+    generation_id: uuid.UUID | None = None
 
 
 def _tenant_filter(tenant_id: uuid.UUID, document_id: uuid.UUID | None = None) -> models.Filter:
@@ -181,6 +182,11 @@ async def search(
             point.payload["chunk_index"],
             point.payload["text"],
             point.score,
+            (
+                uuid.UUID(str(point.payload["generation_id"]))
+                if point.payload.get("generation_id") is not None
+                else None
+            ),
         )
         for point in result.points
     ]

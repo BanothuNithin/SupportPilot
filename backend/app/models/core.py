@@ -130,11 +130,13 @@ class Document(Base):
     claim_token: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
     active_generation: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     chunk_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     error: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         Index("ix_documents_status_updated_at", "status", "updated_at"),
+        Index("ix_documents_deleted_cleanup", "deleted_at", "cleanup_after"),
     )
 
 

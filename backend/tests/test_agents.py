@@ -375,7 +375,14 @@ async def test_grounded_answer_receives_real_rule_when_grader_selects_decoy(
             [
                 (
                     generation_id,
-                    Hit(str(document_id), filename, index, text, 0.99 - index * 0.01),
+                    Hit(
+                        str(document_id),
+                        filename,
+                        index,
+                        text,
+                        0.99 - index * 0.01,
+                        generation_id=generation_id,
+                    ),
                 )
                 for index, text in enumerate(chunks)
             ]

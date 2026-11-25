@@ -45,7 +45,7 @@ flowchart TD
 1. FastAPI verifies the token, resolves the tenant, saves the customer message, and loads recent conversation history. Exact stored handoff responses are excluded before the latest six messages are passed to the graph.
 2. The triage node uses deterministic rules, not an LLM. A detected human request goes directly to escalation; greetings and supported assistant-meta questions go directly to resolution without retrieval.
 3. Other support messages are cleaned for search. Genuine follow-ups are expanded with the most recent prior user question; the original message and conversation wording remain the input to answer generation.
-4. Retrieval loads the tenant's active document generations from PostgreSQL, then searches Qdrant with tenant and document/generation filters plus the configured score threshold. Documents without a published generation can still use legacy generation-less vectors.
+4. Retrieval loads the tenant's active document generations from PostgreSQL, then searches Qdrant with tenant and document/generation filters plus the configured score threshold. Before returning hits to grading or citation generation, it revalidates each hit's document and generation against PostgreSQL. Documents without a published generation can still use legacy generation-less vectors.
 5. If there are hits, the grader makes a short JSON completion to judge whether the context answers the query. If there are no hits, grading is skipped and the question is not considered grounded.
 6. The decide node routes a grounded answer to resolution; no-reliable-answer, low-confidence, and customer-requested-human outcomes go to escalation.
 7. Grounded resolution emits citations and streams an answer. Escalation streams the configured handoff text and persists a support ticket; it does not itself contact or notify a human.
@@ -172,7 +172,7 @@ sequenceDiagram
     A->>S3: Best-effort object cleanup; retries remain in PostgreSQL
 ```
 
-Each claim UUID is also its isolated Qdrant generation ID. Generation-specific point IDs prevent concurrent attempts from overwriting one another. Retrieval trusts only the generation pointer committed in PostgreSQL; staging, retired, abandoned, and late-arriving points are invisible. Retired and abandoned generation records are retained and swept repeatedly so a delayed Qdrant write can be removed by a later cleanup pass. Deleted documents remain tombstoned until initial vector and object cleanup succeeds; their generation ledger remains for later cleanup passes.
+Each claim UUID is also its isolated Qdrant generation ID. Generation-specific point IDs prevent concurrent attempts from overwriting one another. Retrieval trusts only the generation pointer committed in PostgreSQL; staging, retired, abandoned, and late-arriving points are invisible. Retired and abandoned generation records are retained and swept repeatedly so a delayed Qdrant write can be removed by a later cleanup pass. Deleted documents remain tombstoned until vector and object cleanup succeeds; a per-document cleanup_after timestamp schedules retries in bounded batches, while generation ledger records remain for later cleanup passes.
 
 ## Answering a question (built)
 ```mermaid
@@ -323,6 +323,7 @@ erDiagram
         string status
         uuid active_generation
         datetime deleted_at
+        datetime cleanup_after
         int chunk_count
         text error
     }

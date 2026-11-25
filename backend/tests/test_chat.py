@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -13,9 +14,11 @@ from app.llm import get_llm
 from app.llm.base import LLMError
 from app.llm.fake import FakeProvider
 from app.api.routes.chat import send_message
+from app.api.routes import documents as documents_route
 from app.db.session import SessionLocal
 from app.main import app
-from app.models import Conversation, Message, Ticket, User
+from app.models import Conversation, Document, DocumentIndexGeneration, Message, Ticket, User
+from app.rag import store
 from app.rag.store import Hit
 from app.schemas.message import MessageIn
 
@@ -324,3 +327,130 @@ async def test_question_without_retrieval_escalates_without_citations(client, mo
     )
     assert detail.json()["status"] == "escalated"
     assert detail.json()["messages"][-1]["sender"] == "ai"
+
+
+async def test_chat_discards_results_for_document_tombstoned_after_snapshot(
+    client, monkeypatch
+):
+    headers = await register(client, "Acme", "owner@acme.com")
+    conversation_id = await create_conversation(client, headers)
+    tenant_id = uuid.UUID(
+        (await client.get("/api/v1/auth/me", headers=headers)).json()["tenant_id"]
+    )
+    document_id = uuid.uuid4()
+    generation_id = uuid.uuid4()
+    async with SessionLocal() as db:
+        db.add(
+            Document(
+                id=document_id,
+                tenant_id=tenant_id,
+                filename="private-guide.txt",
+                storage_key="",
+                content_type="text/plain",
+                size_bytes=32,
+                status="ready",
+                active_generation=generation_id,
+            )
+        )
+        db.add(
+            DocumentIndexGeneration(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                generation_id=generation_id,
+                status="active",
+            )
+        )
+        await db.commit()
+
+    search_started = asyncio.Event()
+    release_search = asyncio.Event()
+    captured_snapshots = []
+    retrieved_hits = []
+    deleted_text = "Deleted document must not enter the answer."
+
+    async def delayed_search(
+        search_tenant_id, vector, limit, min_score, active_generations
+    ):
+        captured_snapshots.append(dict(active_generations))
+        search_started.set()
+        await release_search.wait()
+        hit = Hit(
+            str(document_id),
+            "private-guide.txt",
+            0,
+            deleted_text,
+            0.99,
+            generation_id=generation_id,
+        )
+        return [hit]
+
+    original_retrieve = nodes.retrieve
+
+    async def record_retrieval(search_tenant_id, question, active_generations):
+        hits = await original_retrieve(
+            search_tenant_id,
+            question,
+            active_generations,
+        )
+        retrieved_hits.append(hits)
+        return hits
+
+    async def defer_document_cleanup(*args, **kwargs):
+        return 0
+
+    class RecordingProvider:
+        def __init__(self):
+            self.complete_calls = []
+            self.stream_calls = []
+
+        async def complete(self, messages, json_mode=False, max_tokens=None):
+            self.complete_calls.append(messages)
+            return json.dumps({"can_answer": True, "confidence": 1.0})
+
+        async def stream(self, messages):
+            self.stream_calls.append(messages)
+            yield "Answer based on retrieved context."
+
+    provider = RecordingProvider()
+    monkeypatch.setattr(store, "search", delayed_search)
+    monkeypatch.setattr(nodes, "retrieve", record_retrieval)
+    monkeypatch.setattr(
+        documents_route,
+        "cleanup_deleted_documents_once",
+        defer_document_cleanup,
+    )
+    monkeypatch.setitem(app.dependency_overrides, get_llm, lambda: provider)
+
+    chat_request = asyncio.create_task(
+        client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers=headers,
+            json={"content": "How do I reset my account password?"},
+        )
+    )
+    await asyncio.wait_for(search_started.wait(), timeout=5)
+    assert captured_snapshots == [{document_id: generation_id}]
+
+    deleted = await client.delete(
+        f"/api/v1/documents/{document_id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204
+    async with SessionLocal() as db:
+        tombstone = await db.get(Document, document_id)
+        assert tombstone is not None
+        assert tombstone.deleted_at is not None
+
+    release_search.set()
+    response = await asyncio.wait_for(chat_request, timeout=10)
+
+    assert response.status_code == 200
+    assert retrieved_hits == [[]]
+    assert "citations" not in [
+        line.removeprefix("event: ")
+        for line in response.text.splitlines()
+        if line.startswith("event: ")
+    ]
+    assert deleted_text not in response.text
+    assert provider.complete_calls == []
+    assert provider.stream_calls == []

@@ -1,5 +1,6 @@
 import uuid
 import io
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -71,7 +72,17 @@ def install_fake_store(monkeypatch):
     async def upsert_generation(tenant_id, document_id, generation_id, filename, chunks, vectors):
         knowledge.setdefault(str(tenant_id), []).extend(
             [
-                (generation_id, Hit(str(document_id), filename, i, text, 0.99))
+                (
+                    generation_id,
+                    Hit(
+                        str(document_id),
+                        filename,
+                        i,
+                        text,
+                        0.99,
+                        generation_id=generation_id,
+                    ),
+                )
                 for i, text in enumerate(chunks)
             ]
         )
@@ -428,10 +439,19 @@ async def test_delete_storage_failure_does_not_block_row_deletion(client, monkey
         pending = await db.get(Document, doc.id)
         assert pending is not None
         assert pending.deleted_at is not None
+        assert pending.cleanup_after is not None
+        retry_at = pending.cleanup_after
     monkeypatch.setattr(storage, "delete", original_delete)
     from app.jobs.cleanup import cleanup_deleted_documents_once
 
-    assert await cleanup_deleted_documents_once(document_id=doc.id, tenant_id=doc.tenant_id) == 1
+    assert (
+        await cleanup_deleted_documents_once(
+            now=retry_at + timedelta(seconds=1),
+            document_id=doc.id,
+            tenant_id=doc.tenant_id,
+        )
+        == 1
+    )
     async with SessionLocal() as db:
         assert await db.get(Document, doc.id) is None
 

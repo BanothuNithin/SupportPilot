@@ -12,9 +12,10 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.llm.base import LLMError
-from app.models import Document
+from app.models import Document, DocumentIndexGeneration
 from app.rag import store
 from app.rag.embeddings import FakeEmbedder
+import app.rag.retrieve as retrieve_mod
 from app.storage import get_storage
 
 
@@ -74,6 +75,78 @@ async def search_document(tenant_id, document_id, query):
         0.0,
         {document_id: doc.active_generation},
     )
+
+
+async def test_retrieve_revalidates_generation_and_preserves_legacy(
+    client, monkeypatch
+):
+    headers = await register(client, "retrieve-revalidation@jobs.example.com")
+    tenant_id = uuid.UUID(
+        (await client.get("/api/v1/auth/me", headers=headers)).json()["tenant_id"]
+    )
+    stale_document_id = uuid.uuid4()
+    legacy_document_id = uuid.uuid4()
+    stale_generation = uuid.uuid4()
+    current_generation = uuid.uuid4()
+    async with SessionLocal() as db:
+        db.add_all(
+            [
+                Document(
+                    id=stale_document_id,
+                    tenant_id=tenant_id,
+                    filename="stale.txt",
+                    storage_key="",
+                    status="ready",
+                    active_generation=current_generation,
+                ),
+                Document(
+                    id=legacy_document_id,
+                    tenant_id=tenant_id,
+                    filename="legacy.txt",
+                    storage_key="",
+                    status="ready",
+                    active_generation=None,
+                ),
+            ]
+        )
+        await db.commit()
+
+    stale_hit = store.Hit(
+        str(stale_document_id),
+        "stale.txt",
+        0,
+        "Stale generation text.",
+        0.99,
+        generation_id=stale_generation,
+    )
+    legacy_hit = store.Hit(
+        str(legacy_document_id),
+        "legacy.txt",
+        0,
+        "Legacy generation-less text.",
+        0.99,
+        generation_id=None,
+    )
+    search_results = [[stale_hit], [legacy_hit]]
+
+    async def fake_search(*args, **kwargs):
+        return search_results.pop(0)
+
+    monkeypatch.setattr(store, "search", fake_search)
+
+    stale_hits = await retrieve_mod.retrieve(
+        tenant_id,
+        "question",
+        {stale_document_id: stale_generation},
+    )
+    legacy_hits = await retrieve_mod.retrieve(
+        tenant_id,
+        "question",
+        {legacy_document_id: None},
+    )
+
+    assert stale_hits == []
+    assert legacy_hits == [legacy_hit]
 
 
 async def test_upload_enqueues_and_only_drain_indexes(client, drain_jobs):
@@ -843,6 +916,172 @@ async def test_tenant_cannot_retrieve_or_delete_another_tenant_generation(client
         0.0,
         {document_id: generation_id},
     ) == []
+
+
+async def test_tombstone_cleanup_backoff_prevents_old_failures_from_starving_later_rows(
+    client, monkeypatch
+):
+    headers = await register(client, "cleanup-backoff@jobs.example.com")
+    tenant_id = uuid.UUID(
+        (await client.get("/api/v1/auth/me", headers=headers)).json()["tenant_id"]
+    )
+    now = datetime.now(timezone.utc)
+    document_ids = [uuid.uuid4() for _ in range(101)]
+    first_batch_ids = set(document_ids[:100])
+    async with SessionLocal() as db:
+        for index, document_id in enumerate(document_ids):
+            db.add(
+                Document(
+                    id=document_id,
+                    tenant_id=tenant_id,
+                    filename=f"deleted-{index}.txt",
+                    storage_key="",
+                    status="ready",
+                    deleted_at=now - timedelta(seconds=len(document_ids) - index),
+                )
+            )
+            db.add(
+                DocumentIndexGeneration(
+                    tenant_id=tenant_id,
+                    document_id=document_id,
+                    generation_id=store.LEGACY_GENERATION_ID,
+                    status="retired",
+                    is_legacy=True,
+                    cleanup_after=now,
+                )
+            )
+        await db.commit()
+
+    original_delete = store.delete_generation
+    fail_first_batch = True
+    attempts: dict[uuid.UUID, int] = {}
+
+    async def fail_old_batch(tenant_id_arg, document_id, generation_id):
+        nonlocal fail_first_batch
+        attempts[document_id] = attempts.get(document_id, 0) + 1
+        if document_id in first_batch_ids and fail_first_batch:
+            raise RuntimeError("temporary generation cleanup failure")
+        await original_delete(tenant_id_arg, document_id, generation_id)
+
+    monkeypatch.setattr(store, "delete_generation", fail_old_batch)
+    delay = max(
+        settings.job_lease_seconds,
+        settings.job_requeue_after_seconds,
+        60,
+    )
+
+    await reconciler_mod.cleanup_deleted_documents_once(now=now)
+    assert all(attempts.get(document_id) == 1 for document_id in document_ids[:100])
+    assert all(document_id not in attempts for document_id in document_ids[100:])
+
+    await reconciler_mod.cleanup_deleted_documents_once(
+        now=now + timedelta(seconds=delay)
+    )
+    assert sum(
+        attempts.get(document_id) == 2 for document_id in document_ids[:100]
+    ) == 99
+    assert sum(
+        attempts.get(document_id) == 1 for document_id in document_ids[:100]
+    ) == 1
+    assert attempts.get(document_ids[100]) == 1
+    assert await get_document(document_ids[100]) is None
+
+    await reconciler_mod.cleanup_deleted_documents_once(
+        now=now + timedelta(seconds=delay + 1)
+    )
+    assert all(attempts.get(document_id) == 2 for document_id in document_ids[:100])
+    assert all(attempts.get(document_id) == 1 for document_id in document_ids[100:])
+    for document_id in document_ids[100:]:
+        assert await get_document(document_id) is None
+
+    fail_first_batch = False
+    await reconciler_mod.cleanup_deleted_documents_once(
+        now=now + timedelta(seconds=2 * delay + 1)
+    )
+    assert all(attempts.get(document_id) == 3 for document_id in document_ids[:100])
+    for document_id in document_ids[:100]:
+        assert await get_document(document_id) is None
+
+
+async def test_deleted_cleanup_does_not_remove_another_documents_active_generation(
+    client,
+):
+    headers = await register(client, "cleanup-document-scope@jobs.example.com")
+    tenant_id = uuid.UUID(
+        (await client.get("/api/v1/auth/me", headers=headers)).json()["tenant_id"]
+    )
+    now = datetime.now(timezone.utc)
+    active_document_id = uuid.uuid4()
+    active_generation = uuid.uuid4()
+    deleted_document_id = uuid.uuid4()
+    async with SessionLocal() as db:
+        db.add_all(
+            [
+                Document(
+                    id=active_document_id,
+                    tenant_id=tenant_id,
+                    filename="active.txt",
+                    storage_key="",
+                    status="ready",
+                    active_generation=active_generation,
+                ),
+                Document(
+                    id=deleted_document_id,
+                    tenant_id=tenant_id,
+                    filename="deleted.txt",
+                    storage_key="",
+                    status="ready",
+                    deleted_at=now,
+                ),
+                DocumentIndexGeneration(
+                    tenant_id=tenant_id,
+                    document_id=active_document_id,
+                    generation_id=active_generation,
+                    status="active",
+                ),
+                DocumentIndexGeneration(
+                    tenant_id=tenant_id,
+                    document_id=deleted_document_id,
+                    generation_id=store.LEGACY_GENERATION_ID,
+                    status="retired",
+                    is_legacy=True,
+                    cleanup_after=now,
+                ),
+            ]
+        )
+        await db.commit()
+
+    [vector] = await FakeEmbedder().embed(["active generation"])
+    await store.upsert_generation(
+        tenant_id,
+        active_document_id,
+        active_generation,
+        "active.txt",
+        ["Another document's active vector."],
+        [vector],
+    )
+
+    await reconciler_mod.cleanup_deleted_documents_once(
+        now=now,
+        document_id=deleted_document_id,
+        tenant_id=tenant_id,
+    )
+
+    active_points, _ = await store.client.scroll(
+        store.COLLECTION,
+        scroll_filter=store._generation_filter(
+            tenant_id,
+            active_document_id,
+            active_generation,
+        ),
+        limit=10,
+        with_payload=True,
+        with_vectors=False,
+    )
+    assert active_points
+    active_document = await get_document(active_document_id)
+    assert active_document is not None
+    assert active_document.active_generation == active_generation
 
 
 async def test_worker_stops_after_processed_job_and_drops_bad_jobs(monkeypatch, fake_redis):
