@@ -1,14 +1,20 @@
 import asyncio
+import json
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, update
 
+from app.actions.executor import ToolExecutionError, get_tool_executor, redact
+from app.actions.registry import TOOLS, validate_arguments
+from app.actions.sanitize import truncate
 from app.core.config import settings
 from app.db.session import SessionLocal
+from app.integrations.service import get_env
 from app.jobs.cleanup import LEGACY_GENERATION_ID
-from app.models import Document, DocumentIndexGeneration
+from app.models import Document, DocumentIndexGeneration, PendingAction, Ticket
 from app.rag import store
 from app.rag.chunking import chunk_text
 from app.rag.embeddings import get_embedder
@@ -355,4 +361,169 @@ async def _set_failed(
             )
         )
         await _abandon_generation(db, tenant_id, document_id, claim_token, now)
+        await db.commit()
+
+
+async def handle_execute_action(
+    action_id: str | uuid.UUID, tenant_id: str | uuid.UUID
+) -> None:
+    started = time.monotonic()
+    outcome = "ignored"
+    claimed_tenant_id = None
+    execution_started = False
+    try:
+        action_uuid = uuid.UUID(str(action_id))
+        tenant_uuid = uuid.UUID(str(tenant_id))
+        claim_time = datetime.now(timezone.utc)
+        locked_until = claim_time + timedelta(seconds=settings.job_lease_seconds)
+        async with SessionLocal() as db:
+            claim = await db.execute(
+                update(PendingAction)
+                .where(
+                    PendingAction.id == action_uuid,
+                    PendingAction.tenant_id == tenant_uuid,
+                    PendingAction.status == "approved",
+                )
+                .values(
+                    status="executing",
+                    locked_until=locked_until,
+                    updated_at=claim_time,
+                )
+                .returning(
+                    PendingAction.tenant_id,
+                    PendingAction.tool,
+                    PendingAction.arguments,
+                    PendingAction.ticket_id,
+                )
+            )
+            row = claim.first()
+            if row is None:
+                await db.rollback()
+                return
+            row_tenant_id, tool, serialized_arguments, ticket_id = row
+            claimed_tenant_id = row_tenant_id
+            await db.commit()
+
+        spec = TOOLS.get(tool)
+        if spec is None:
+            await _fail_action(action_uuid, row_tenant_id, "Tool is not allowed")
+            outcome = "failed"
+            return
+
+        async with SessionLocal() as db:
+            env = await get_env(db, row_tenant_id, spec.integration_kind)
+        if env is None:
+            await _fail_action(action_uuid, row_tenant_id, "Integration not configured")
+            outcome = "failed"
+            return
+
+        try:
+            arguments = validate_arguments(tool, json.loads(serialized_arguments))
+            if tool == "create_github_issue":
+                marker = f"\n\n<!-- supportpilot-action:{action_uuid} -->"
+                arguments["body"] = truncate(
+                    arguments["body"], 6000 - len(marker)
+                ) + marker
+            executor = get_tool_executor()
+            execution_started = True
+            result = await executor.call(tool, arguments, env)
+        except ToolExecutionError as exc:
+            await _fail_action(
+                action_uuid, row_tenant_id, redact(str(exc), env)[:500]
+            )
+            outcome = "failed"
+            return
+        except Exception:
+            await _fail_action(
+                action_uuid,
+                row_tenant_id,
+                "Unexpected error while executing the action",
+            )
+            outcome = "failed"
+            return
+
+        finished_at = datetime.now(timezone.utc)
+        async with SessionLocal() as db:
+            finalized = await db.execute(
+                update(PendingAction)
+                .where(
+                    PendingAction.id == action_uuid,
+                    PendingAction.tenant_id == row_tenant_id,
+                    PendingAction.status == "executing",
+                )
+                .values(
+                    status="executed",
+                    result=json.dumps(result),
+                    error=None,
+                    executed_at=finished_at,
+                    locked_until=None,
+                    updated_at=finished_at,
+                )
+            )
+            if finalized.rowcount != 1:
+                await db.rollback()
+                return
+            if (
+                tool == "create_github_issue"
+                and ticket_id is not None
+            ):
+                url = result.get("url")
+                if isinstance(url, str) and url.startswith("https://"):
+                    await db.execute(
+                        update(Ticket)
+                        .where(
+                            Ticket.id == ticket_id,
+                            Ticket.tenant_id == row_tenant_id,
+                        )
+                        .values(external_issue_url=url)
+                    )
+            await db.commit()
+        outcome = "executed"
+    except Exception as exc:
+        outcome = "failed" if claimed_tenant_id is not None else "error"
+        if claimed_tenant_id is not None and not execution_started:
+            try:
+                await _fail_action(
+                    action_uuid,
+                    claimed_tenant_id,
+                    "Unexpected error while executing the action",
+                )
+            except Exception:
+                log.warning(
+                    "action failure state could not be saved action_id=%s",
+                    action_id,
+                )
+        log.warning(
+            "action execution handler failed action_id=%s error_type=%s",
+            action_id,
+            type(exc).__name__,
+        )
+    finally:
+        log.info(
+            "job finished job_type=execute_action id=%s duration_ms=%s outcome=%s",
+            action_id,
+            int((time.monotonic() - started) * 1000),
+            outcome,
+        )
+
+
+async def _fail_action(
+    action_id: uuid.UUID, tenant_id: uuid.UUID, error: str
+) -> None:
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as db:
+        await db.execute(
+            update(PendingAction)
+            .where(
+                PendingAction.id == action_id,
+                PendingAction.tenant_id == tenant_id,
+                PendingAction.status == "executing",
+            )
+            .values(
+                status="failed",
+                error=error[:500],
+                locked_until=None,
+                updated_at=now,
+            )
+        )
         await db.commit()

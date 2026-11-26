@@ -200,12 +200,19 @@ class PendingAction(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending", server_default="pending")
     result: Mapped[str | None] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     edited: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     decided_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_now,
+        onupdate=_now,
+        server_default=func.now(),
     )
 
     __table_args__ = (

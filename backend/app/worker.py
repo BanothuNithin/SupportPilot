@@ -4,13 +4,16 @@ import time
 from collections.abc import Awaitable, Callable
 
 from app.core.config import settings
-from app.jobs.handlers import handle_index_document
+from app.jobs.handlers import handle_execute_action, handle_index_document
 from app.jobs.queue import dequeue
 from app.jobs.reconciler import reconcile_once
 
 log = logging.getLogger(__name__)
 JobHandler = Callable[[str, str], Awaitable[None]]
-handlers: dict[str, JobHandler] = {"index_document": handle_index_document}
+handlers: dict[str, JobHandler] = {
+    "index_document": handle_index_document,
+    "execute_action": handle_execute_action,
+}
 
 
 async def _reconcile_loop() -> None:

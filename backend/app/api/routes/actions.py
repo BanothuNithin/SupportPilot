@@ -7,13 +7,13 @@ from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.actions.executor import ToolExecutionError, get_tool_executor, redact, ToolExecutor
 from app.actions.registry import TOOLS, UnknownTool, validate_arguments
 from app.api.deps import get_current_user, require_roles
 from app.api.tenant import get_owned
 from app.db.session import get_db
 from app.integrations.service import get_env
-from app.models import PendingAction, Role, Ticket, User
+from app.jobs.queue import enqueue
+from app.models import PendingAction, Role, User
 from app.schemas.action import ActionApproveIn, ActionOut
 
 router = APIRouter(prefix="/actions", tags=["actions"])
@@ -60,9 +60,9 @@ async def approve_action(
     body: ActionApproveIn,
     user: User = Depends(require_roles(Role.owner, Role.admin)),
     db: AsyncSession = Depends(get_db),
-    executor: ToolExecutor = Depends(get_tool_executor),
 ):
     action = await get_owned(db, PendingAction, action_id, user.tenant_id)
+    tenant_id = action.tenant_id
     if action.tool not in TOOLS:
         raise HTTPException(status.HTTP_409_CONFLICT, "Tool is not allowed")
 
@@ -83,19 +83,34 @@ async def approve_action(
             PendingAction.tenant_id == action.tenant_id,
             PendingAction.status.in_(["pending", "failed"]),
         )
-        .values(status="approved", decided_by=user.id, decided_at=now)
+        .values(
+            status="approved",
+            decided_by=user.id,
+            decided_at=now,
+            updated_at=now,
+            locked_until=None,
+            error=None,
+            result=None,
+            executed_at=None,
+        )
     )
     if cas.rowcount != 1:
         await db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "Action is no longer pending")
     await db.commit()
+    await db.refresh(action)
 
     spec = TOOLS[action.tool]
     try:
         env = await get_env(db, action.tenant_id, spec.integration_kind)
     except Exception:
         await db.rollback()
-        action = await get_owned(db, PendingAction, action_id, user.tenant_id)
+        action = await db.scalar(
+            select(PendingAction).where(
+                PendingAction.id == action_id,
+                PendingAction.tenant_id == tenant_id,
+            )
+        )
         action.status = "failed"
         action.error = "Integration credentials could not be loaded"
         await db.commit()
@@ -106,28 +121,7 @@ async def approve_action(
         await db.commit()
         return _action_out(action)
 
-    try:
-        result = await executor.call(action.tool, json.loads(action.arguments), env)
-    except ToolExecutionError as exc:
-        action.status = "failed"
-        action.error = redact(str(exc), env)[:500]
-        await db.commit()
-        return _action_out(action)
-    except Exception as exc:
-        action.status = "failed"
-        action.error = redact(str(exc), env)[:500]
-        await db.commit()
-        return _action_out(action)
-
-    action.status = "executed"
-    action.result = json.dumps(result)
-    action.executed_at = datetime.now(timezone.utc)
-    if action.tool == "create_github_issue" and action.ticket_id:
-        url = result.get("url")
-        if isinstance(url, str) and url.startswith("https://"):
-            ticket = await get_owned(db, Ticket, action.ticket_id, action.tenant_id)
-            ticket.external_issue_url = url
-    await db.commit()
+    await enqueue("execute_action", action.id, action.tenant_id)
     return _action_out(action)
 
 
