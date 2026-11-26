@@ -120,21 +120,24 @@ def install_fake_store(monkeypatch):
 async def test_upload_then_list_shows_ready_document_with_chunks(client, monkeypatch, drain_jobs):
     install_fake_store(monkeypatch)
     headers = await register(client, "Acme", "owner@acme.com")
+    contents = b"Alpha beta gamma delta. " * 20
 
     uploaded = await client.post(
         "/api/v1/documents",
         headers=headers,
-        files={"file": ("guide.txt", b"Alpha beta gamma delta. " * 20, "text/plain")},
+        files={"file": ("guide.txt", contents, "text/plain")},
     )
 
     assert uploaded.status_code == 202
     assert uploaded.json()["status"] == "queued"
+    assert uploaded.json()["size_bytes"] == len(contents)
     await drain_jobs()
     listed = await client.get("/api/v1/documents", headers=headers)
     assert listed.status_code == 200
     assert len(listed.json()) == 1
     assert listed.json()[0]["status"] == "ready"
     assert listed.json()[0]["chunk_count"] >= 1
+    assert listed.json()[0]["size_bytes"] == len(contents)
 
 
 async def test_executable_upload_returns_415(client):

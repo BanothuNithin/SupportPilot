@@ -6,7 +6,7 @@ export type PendingAction = {
   conversation_id: string;
   tool: string;
   arguments: Record<string, unknown>;
-  status: string;
+  status: "pending" | "approved" | "executing" | "executed" | "failed" | "rejected";
   result: Record<string, unknown> | null;
   error: string | null;
   edited: boolean;

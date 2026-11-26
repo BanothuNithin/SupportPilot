@@ -7,6 +7,7 @@ import {
   AuthError,
   Conversation,
   Message,
+  RateLimitError,
   createConversation,
   getMessages,
   getTokens,
@@ -173,6 +174,8 @@ export default function ChatPage() {
             return message.content ? [{ ...message, id: partialMessageId }] : [];
           }),
         );
+      } else if (err instanceof RateLimitError) {
+        setError(err.message);
       } else {
         handleError(err);
       }

@@ -4,20 +4,41 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { AuthError, getTokens } from "@/lib/api";
-import { Doc, deleteDocument, listDocuments, uploadDocument } from "@/lib/documents";
+import {
+  Doc,
+  deleteDocument,
+  downloadDocument,
+  listDocuments,
+  reindexDocument,
+  uploadDocument,
+} from "@/lib/documents";
 
-const badge: Record<string, string> = {
+const badge: Record<Doc["status"], string> = {
+  queued: "bg-blue-900/60 text-blue-300",
   ready: "bg-emerald-900/60 text-emerald-300",
   indexing: "bg-amber-900/60 text-amber-300",
   failed: "bg-red-900/60 text-red-300",
-  uploaded: "bg-slate-800 text-slate-300",
 };
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let size = bytes / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size.toFixed(1)} ${units[unitIndex]}`;
+}
 
 export default function DocumentsPage() {
   const router = useRouter();
   const [docs, setDocs] = useState<Doc[]>([]);
   const [error, setError] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [reindexing, setReindexing] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState<string | null>(null);
 
   const handleError = useCallback(
     (e: unknown) => {
@@ -49,13 +70,19 @@ export default function DocumentsPage() {
     })();
   }, [router, handleError]);
 
-  // while any document is still indexing, poll every 2 seconds
-  const anyIndexing = docs.some((d) => d.status === "indexing");
+  const hasQueuedWork = docs.some((d) => d.status === "queued" || d.status === "indexing");
   useEffect(() => {
-    if (!anyIndexing) return;
-    const timer = setInterval(refresh, 2000);
+    if (!hasQueuedWork) return;
+    let refreshing = false;
+    const timer = setInterval(() => {
+      if (refreshing) return;
+      refreshing = true;
+      void refresh().finally(() => {
+        refreshing = false;
+      });
+    }, 2000);
     return () => clearInterval(timer);
-  }, [anyIndexing, refresh]);
+  }, [hasQueuedWork, refresh]);
 
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -80,6 +107,44 @@ export default function DocumentsPage() {
       await refresh();
     } catch (err) {
       handleError(err);
+    }
+  }
+
+  async function reindex(id: string) {
+    if (reindexing !== null) return;
+    setReindexing(id);
+    setError("");
+    try {
+      await reindexDocument(id);
+      await refresh();
+    } catch (err) {
+      handleError(err);
+    } finally {
+      setReindexing(null);
+    }
+  }
+
+  async function download(doc: Doc) {
+    if (downloading !== null) return;
+    setDownloading(doc.id);
+    setError("");
+    try {
+      const blob = await downloadDocument(doc.id);
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      try {
+        anchor.href = objectUrl;
+        anchor.download = doc.filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+      } finally {
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      }
+    } catch (err) {
+      handleError(err);
+    } finally {
+      setDownloading(null);
     }
   }
 
@@ -111,10 +176,28 @@ export default function DocumentsPage() {
                   {d.status === "ready" && `${d.chunk_count} chunks`}
                   {d.status === "failed" && (d.error ?? "Indexing failed")}
                   {d.status === "indexing" && "Reading, chunking and embedding..."}
+                  {d.status === "queued" && "Waiting to be indexed..."}
+                  {d.size_bytes != null && ` · ${formatSize(d.size_bytes)}`}
                 </p>
               </div>
               <div className="ml-4 flex items-center gap-3">
-                <span className={`rounded-full px-2 py-0.5 text-xs ${badge[d.status] ?? badge.uploaded}`}>{d.status}</span>
+                <span className={`rounded-full px-2 py-0.5 text-xs ${badge[d.status]}`}>{d.status}</span>
+                {(d.status === "failed" || d.status === "ready") && (
+                  <button
+                    onClick={() => reindex(d.id)}
+                    disabled={reindexing !== null}
+                    className="text-sm text-violet-300 hover:text-violet-200 disabled:opacity-50"
+                  >
+                    {reindexing === d.id ? "Reindexing..." : "Reindex"}
+                  </button>
+                )}
+                <button
+                  onClick={() => download(d)}
+                  disabled={downloading !== null}
+                  className="text-sm text-slate-300 hover:text-white disabled:opacity-50"
+                >
+                  {downloading === d.id ? "Downloading..." : "Download"}
+                </button>
                 <button onClick={() => remove(d.id)} className="text-sm text-slate-400 hover:text-red-400">
                   Delete
                 </button>

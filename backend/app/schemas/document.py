@@ -10,6 +10,7 @@ class DocumentOut(BaseModel):
     status: str
     chunk_count: int
     error: str | None
+    size_bytes: int
     created_at: datetime
 
     model_config = {"from_attributes": True}

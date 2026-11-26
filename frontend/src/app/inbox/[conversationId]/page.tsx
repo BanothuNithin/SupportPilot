@@ -21,9 +21,10 @@ import { Ticket, listTickets, setTicketStatus } from "@/lib/tickets";
 type ConversationDetail = Conversation & { messages: Message[] };
 type ActionDraft = { title?: string; body?: string; text?: string };
 
-const actionBadge: Record<string, string> = {
+const actionBadge: Record<PendingAction["status"], string> = {
   pending: "bg-amber-900/60 text-amber-300",
   approved: "bg-blue-900/60 text-blue-300",
+  executing: "bg-violet-900/60 text-violet-300",
   executed: "bg-emerald-900/60 text-emerald-300",
   failed: "bg-red-900/60 text-red-300",
   rejected: "bg-slate-800 text-slate-300",
@@ -97,6 +98,25 @@ function ConversationStaffPage() {
       return next;
     });
   }, [conversationId]);
+
+  const hasActionInProgress = actions.some(
+    (action) => action.status === "approved" || action.status === "executing",
+  );
+
+  useEffect(() => {
+    if (!hasActionInProgress) return;
+    let refreshing = false;
+    const timer = setInterval(() => {
+      if (refreshing) return;
+      refreshing = true;
+      void refreshActions()
+        .catch(handleError)
+        .finally(() => {
+          refreshing = false;
+        });
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [hasActionInProgress, refreshActions, handleError]);
 
   const refresh = useCallback(async () => {
     const [convResponse, tickets, staff] = await Promise.all([
@@ -182,6 +202,15 @@ function ConversationStaffPage() {
 
   async function approve(action: PendingAction) {
     if (busyAction) return;
+    if (
+      action.status === "failed" &&
+      action.error?.startsWith("Outcome unknown") &&
+      !window.confirm(
+        "This action may already have run. Check GitHub or Slack first. Retry anyway?",
+      )
+    ) {
+      return;
+    }
     setBusyAction(action.id);
     setError("");
     const draft = drafts[action.id] ?? {};
@@ -301,8 +330,20 @@ function ConversationStaffPage() {
                   <article key={action.id} className="space-y-3 rounded-xl border border-slate-800 bg-slate-950/70 p-3">
                     <div className="flex items-start justify-between gap-2">
                       <p className="break-all text-sm font-medium">{action.tool === "create_github_issue" ? "Create GitHub issue" : action.tool === "post_slack_alert" ? "Post Slack alert" : action.tool}</p>
-                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${actionBadge[action.status] ?? "bg-slate-800 text-slate-300"}`}>{action.status}</span>
+                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${actionBadge[action.status]}`}>{action.status}</span>
                     </div>
+                    {action.status === "approved" && (
+                      <p role="status" className="text-sm text-blue-300">Queued for execution</p>
+                    )}
+                    {action.status === "executing" && (
+                      <p role="status" className="flex items-center gap-2 text-sm text-violet-300">
+                        <span
+                          aria-hidden="true"
+                          className="h-3 w-3 animate-spin rounded-full border-2 border-violet-300/30 border-t-violet-300"
+                        />
+                        Executing...
+                      </p>
+                    )}
                     {editable && action.tool === "create_github_issue" && (
                       <>
                         <label className="block space-y-1 text-xs text-slate-400">Issue title

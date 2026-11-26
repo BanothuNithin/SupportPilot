@@ -25,6 +25,26 @@ export type Message = {
 
 export class AuthError extends Error {}
 
+export class RateLimitError extends Error {
+  constructor(readonly retryAfterSeconds: number) {
+    const unit = retryAfterSeconds === 1 ? "second" : "seconds";
+    super(`You're sending messages too quickly. Please wait ${retryAfterSeconds} ${unit}.`);
+    this.name = "RateLimitError";
+  }
+}
+
+function retryAfterSeconds(value: string | null): number {
+  if (!value) return 10;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) {
+    return seconds >= 0 ? Math.ceil(seconds) : 10;
+  }
+  const retryAt = Date.parse(value);
+  return Number.isNaN(retryAt)
+    ? 10
+    : Math.max(0, Math.ceil((retryAt - Date.now()) / 1000));
+}
+
 // ---- token storage (localStorage for now; see DECISIONS.md for the trade-off) ----
 export function getTokens(): Tokens | null {
   if (typeof window === "undefined") return null;
@@ -193,6 +213,9 @@ export async function streamMessage(
     body: JSON.stringify({ content }),
     signal,
   });
+  if (r.status === 429) {
+    throw new RateLimitError(retryAfterSeconds(r.headers.get("Retry-After")));
+  }
   if (!r.ok || !r.body) throw new Error(`Request failed (${r.status})`);
 
   const reader = r.body.getReader();
