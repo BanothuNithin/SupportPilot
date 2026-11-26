@@ -21,6 +21,7 @@ from app.agents.graph import graph
 from app.api.deps import get_current_user
 from app.api.tenant import get_owned
 from app.core.config import settings
+from app.core.ratelimit import rate_limit
 from app.db.session import SessionLocal, get_db
 from app.llm import get_llm
 from app.llm.base import LLMError, LLMProvider
@@ -158,6 +159,18 @@ async def send_message(
     llm: LLMProvider = Depends(get_llm),
 ):
     conv = await get_owned(db, Conversation, conversation_id, user.tenant_id)
+    await rate_limit(
+        f"rl:chat:user:{user.id}",
+        limit=settings.chat_rate_limit_user_per_minute,
+        window_seconds=60,
+        fail_open=True,
+    )
+    await rate_limit(
+        f"rl:chat:tenant:{user.tenant_id}",
+        limit=settings.chat_rate_limit_tenant_per_minute,
+        window_seconds=60,
+        fail_open=True,
+    )
     tenant_id, conv_id = conv.tenant_id, conv.id
     was_escalated = conv.status == "escalated"
     if conv.status == "resolved":

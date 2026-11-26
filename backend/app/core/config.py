@@ -22,6 +22,9 @@ class Settings(BaseSettings):
 
     rag_top_k: int = 4
     rag_min_score: float = 0.35
+    chat_rate_limit_user_per_minute: int = 20
+    chat_rate_limit_tenant_per_minute: int = 120
+    embed_cache_ttl_seconds: int = 3600
     max_upload_bytes: int = 5 * 1024 * 1024
     history_limit: int = 6
 

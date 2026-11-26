@@ -1,9 +1,12 @@
+import hashlib
+import json
 import logging
 import uuid
 from collections.abc import Mapping
 
 from sqlalchemy import select
 
+from app.core import redis as r
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import Document
@@ -11,6 +14,34 @@ from app.rag import store
 from app.rag.embeddings import get_embedder
 
 log = logging.getLogger(__name__)
+
+
+async def _query_vector(tenant_id: uuid.UUID, question: str) -> list[float]:
+    digest = hashlib.sha256(
+        f"{settings.embed_model}\n{question}".encode("utf-8")
+    ).hexdigest()
+    key = f"emb:{tenant_id}:{digest}"
+    try:
+        cached = await r.redis_client.get(key)
+        if cached is not None:
+            vector = json.loads(cached)
+            if isinstance(vector, list) and all(
+                isinstance(value, (int, float)) for value in vector
+            ):
+                return vector
+    except Exception:
+        log.warning("Query embedding cache read failed; embedding the query")
+
+    [vector] = await get_embedder().embed([question])
+    try:
+        await r.redis_client.set(
+            key,
+            json.dumps(vector),
+            ex=settings.embed_cache_ttl_seconds,
+        )
+    except Exception:
+        log.warning("Query embedding cache write failed")
+    return vector
 
 
 async def _revalidate_hits(
@@ -59,7 +90,7 @@ async def retrieve(
     try:
         if not active_generations:
             return []
-        [vector] = await get_embedder().embed([question])
+        vector = await _query_vector(tenant_id, question)
         hits = await store.search(
             tenant_id,
             vector,
