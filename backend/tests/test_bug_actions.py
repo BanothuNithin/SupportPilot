@@ -9,12 +9,15 @@ from app.actions.executor import ToolExecutionError
 from app.agents import prompts
 from app.agents.rules import fast_path, rule_triage
 from app.core.config import settings
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal as _SessionLocal
 from app.models import PendingAction, Ticket
 import app.jobs.handlers as handlers
 import app.jobs.queue as job_queue
 import app.jobs.reconciler as reconciler
 import app.worker as worker
+from tests.tenant_test_utils import activate_test_tenant, tenant_scoped_session_factory
+
+SessionLocal = tenant_scoped_session_factory(_SessionLocal)
 
 
 async def register(client, company, email, role=None):
@@ -24,6 +27,7 @@ async def register(client, company, email, role=None):
     )
     assert response.status_code == 201
     headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+    activate_test_tenant(headers)
     if role is None:
         return headers
     invited = await client.post(
@@ -40,6 +44,7 @@ async def register(client, company, email, role=None):
 
 
 async def create_conversation(client, headers):
+    activate_test_tenant(headers)
     customer = await client.post(
         "/api/v1/customers",
         headers=headers,
@@ -60,6 +65,7 @@ async def me(client, headers):
 
 
 async def configure_integrations(client, headers, github=True, slack=True):
+    activate_test_tenant(headers)
     if github:
         response = await client.put(
             "/api/v1/integrations/github",

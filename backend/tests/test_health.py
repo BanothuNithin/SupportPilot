@@ -4,7 +4,7 @@ import app.rag.store as store
 import app.storage as storage_module
 
 
-CHECKS = {"postgres", "redis", "qdrant", "storage"}
+CHECKS = {"postgres", "redis", "qdrant", "storage", "rls_enforced"}
 
 
 async def test_readiness_returns_ok_when_all_dependencies_are_available(client):
@@ -18,6 +18,7 @@ async def test_readiness_returns_ok_when_all_dependencies_are_available(client):
             "redis": True,
             "qdrant": True,
             "storage": True,
+            "rls_enforced": True,
         },
     }
 
@@ -50,9 +51,14 @@ async def test_readiness_reports_postgres_failure_without_details(client, monkey
     monkeypatch.setattr(
         main_module, "SessionLocal", lambda: FailingSession(), raising=False
     )
+    monkeypatch.setattr(main_module, "_rls_enforced", lambda: _true())
     response = await client.get("/health/ready")
 
     assert_dependency_failed(response, "postgres", "private-db")
+
+
+async def _true():
+    return True
 
 
 async def test_readiness_reports_redis_failure_without_details(client, monkeypatch):

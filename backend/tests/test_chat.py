@@ -15,12 +15,15 @@ from app.llm.base import LLMError
 from app.llm.fake import FakeProvider
 from app.api.routes.chat import send_message
 from app.api.routes import documents as documents_route
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal as _SessionLocal
 from app.main import app
 from app.models import Conversation, Document, DocumentIndexGeneration, Message, Ticket, User
 from app.rag import store
 from app.rag.store import Hit
 from app.schemas.message import MessageIn
+from tests.tenant_test_utils import activate_test_tenant, tenant_scoped_session_factory
+
+SessionLocal = tenant_scoped_session_factory(_SessionLocal)
 
 
 async def register(client, company, email):
@@ -29,10 +32,13 @@ async def register(client, company, email):
         json={"company_name": company, "email": email, "password": "password123"},
     )
     assert response.status_code == 201
-    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+    headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+    activate_test_tenant(headers)
+    return headers
 
 
 async def create_conversation(client, headers):
+    activate_test_tenant(headers)
     customer = await client.post(
         "/api/v1/customers", headers=headers, json={"email": "person@example.com"}
     )
@@ -340,6 +346,7 @@ async def test_chat_discards_results_for_document_tombstoned_after_snapshot(
     document_id = uuid.uuid4()
     generation_id = uuid.uuid4()
     async with SessionLocal() as db:
+        activate_test_tenant(headers)
         db.add(
             Document(
                 id=document_id,
@@ -437,6 +444,7 @@ async def test_chat_discards_results_for_document_tombstoned_after_snapshot(
     )
     assert deleted.status_code == 204
     async with SessionLocal() as db:
+        activate_test_tenant(headers)
         tombstone = await db.get(Document, document_id)
         assert tombstone is not None
         assert tombstone.deleted_at is not None

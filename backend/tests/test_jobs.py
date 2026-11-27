@@ -12,11 +12,15 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.llm.base import LLMError
-from app.models import Document, DocumentIndexGeneration
+from app.models import Document, DocumentIndexGeneration, Tenant
 from app.rag import store
 from app.rag.embeddings import FakeEmbedder
 import app.rag.retrieve as retrieve_mod
 from app.storage import get_storage
+from tests.tenant_test_utils import set_test_tenant, tenant_id_from_headers
+
+
+_DOCUMENT_TENANTS = {}
 
 
 async def register(client, email="owner@jobs.example.com"):
@@ -35,6 +39,7 @@ async def upload(client, headers, name="guide.txt", contents=b"Durable jobs inde
         files={"file": (name, contents, "text/plain")},
     )
     assert response.status_code == 202
+    _DOCUMENT_TENANTS[uuid.UUID(response.json()["id"])] = tenant_id_from_headers(headers)
     return response.json()
 
 
@@ -42,7 +47,18 @@ async def create_queued_document(tenant_id, filename="direct.txt", contents=b"In
     document_id = uuid.uuid4()
     key = f"tenants/{tenant_id}/documents/{document_id}/file.txt"
     await get_storage().put(key, contents, "text/plain")
+    _DOCUMENT_TENANTS[document_id] = tenant_id
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
+        if await db.get(Tenant, tenant_id) is None:
+            db.add(
+                Tenant(
+                    id=tenant_id,
+                    name="Jobs test tenant",
+                    slug=f"jobs-test-{tenant_id}",
+                )
+            )
+            await db.flush()
         db.add(
             Document(
                 id=document_id,
@@ -60,6 +76,7 @@ async def create_queued_document(tenant_id, filename="direct.txt", contents=b"In
 
 async def get_document(document_id):
     async with SessionLocal() as db:
+        await set_test_tenant(db, _DOCUMENT_TENANTS[document_id])
         return await db.get(Document, document_id)
 
 
@@ -89,6 +106,7 @@ async def test_retrieve_revalidates_generation_and_preserves_legacy(
     stale_generation = uuid.uuid4()
     current_generation = uuid.uuid4()
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         db.add_all(
             [
                 Document(
@@ -172,6 +190,7 @@ async def test_lost_redis_job_is_reconciled_and_drained(client, fake_redis, drai
         uploaded = await upload(client, headers)
     document_id = uuid.UUID(uploaded["id"])
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id_from_headers(headers))
         doc = await db.get(Document, document_id)
         doc.updated_at = datetime.now(timezone.utc) - timedelta(
             seconds=settings.job_requeue_after_seconds + 1
@@ -196,6 +215,7 @@ async def test_duplicate_delivery_and_forced_rerun_keep_vector_count(client, dra
     original_chunk_count = doc.chunk_count
     assert original_chunk_count > 1
     async with SessionLocal() as db:
+        await set_test_tenant(db, doc.tenant_id)
         doc = await db.get(Document, doc_id)
         doc.status = "queued"
         await db.commit()
@@ -281,6 +301,7 @@ async def test_reconciler_recovers_expired_leases(attempts, expected):
     tenant_id = uuid.uuid4()
     doc_id = await create_queued_document(tenant_id)
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         doc = await db.get(Document, doc_id)
         doc.status = "indexing"
         doc.attempts = attempts
@@ -314,6 +335,7 @@ async def test_reindex_rules_and_failed_reindex(client, drain_jobs, monkeypatch)
     queued = await client.post(f"/api/v1/documents/{doc_id}/reindex", headers=owner)
     assert queued.status_code == 409
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id_from_headers(owner))
         doc = await db.get(Document, uuid.UUID(doc_id))
         doc.storage_key = ""
         doc.status = "failed"
@@ -323,6 +345,7 @@ async def test_reindex_rules_and_failed_reindex(client, drain_jobs, monkeypatch)
     assert missing.status_code == 409
     assert missing.json()["detail"] == "Original file is not stored"
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id_from_headers(owner))
         doc = await db.get(Document, uuid.UUID(doc_id))
         doc.storage_key = "tenants/reindex/documents/reindex/file.txt"
         doc.status = "failed"
@@ -402,6 +425,7 @@ async def test_expired_claim_cannot_finalize_after_second_worker_claims(
     await asyncio.wait_for(first_started.wait(), timeout=5)
 
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         doc = await db.get(Document, document_id)
         old_token = doc.claim_token
         assert old_token is not None
@@ -414,6 +438,7 @@ async def test_expired_claim_cannot_finalize_after_second_worker_claims(
     second_worker = asyncio.create_task(handler(document_id, tenant_id))
     await asyncio.wait_for(second_started.wait(), timeout=5)
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         doc = await db.get(Document, document_id)
         new_token = doc.claim_token
         assert doc.status == "indexing"
@@ -424,6 +449,7 @@ async def test_expired_claim_cannot_finalize_after_second_worker_claims(
     release_first.set()
     await asyncio.wait_for(first_worker, timeout=5)
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         doc = await db.get(Document, document_id)
         assert doc.status == "indexing"
         assert doc.claim_token == new_token
@@ -464,11 +490,13 @@ async def test_indexing_lease_is_renewed(client, monkeypatch):
     )
     await asyncio.wait_for(embed_started.wait(), timeout=5)
     async with SessionLocal() as db:
+        await set_test_tenant(db, doc.tenant_id)
         claimed = await db.get(Document, document_id)
         first_lease = claimed.locked_until
         assert claimed.claim_token is not None
     await asyncio.sleep(1.2)
     async with SessionLocal() as db:
+        await set_test_tenant(db, doc.tenant_id)
         renewed = await db.get(Document, document_id)
         renewed_until = renewed.locked_until
     if renewed_until.tzinfo is None:
@@ -520,6 +548,7 @@ async def test_stale_qdrant_write_cannot_replace_published_generation(
     await asyncio.wait_for(first_write_started.wait(), timeout=5)
 
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         doc = await db.get(Document, document_id)
         doc.locked_until = datetime.now(timezone.utc) - timedelta(seconds=1)
         await db.commit()
@@ -584,6 +613,7 @@ async def test_legacy_generation_filter_and_multiple_documents(client):
     vector = (await FakeEmbedder().embed(["shared query"]))[0]
 
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         first = await db.get(Document, first_id)
         first.status = "ready"
         second = await db.get(Document, second_id)
@@ -646,6 +676,7 @@ async def test_legacy_generation_filter_and_multiple_documents(client):
         [vector],
     )
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         first = await db.get(Document, first_id)
         first.active_generation = replacement_generation
         await db.commit()
@@ -742,6 +773,7 @@ async def test_abandoned_staging_generation_is_retried_by_cleanup(client, monkey
     )
     await asyncio.wait_for(write_finished.wait(), timeout=5)
     async with SessionLocal() as db:
+        await set_test_tenant(db, doc.tenant_id)
         claimed = await db.get(Document, document_id)
         generation_id = claimed.claim_token
         claimed.locked_until = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -929,7 +961,9 @@ async def test_tombstone_cleanup_backoff_prevents_old_failures_from_starving_lat
     document_ids = [uuid.uuid4() for _ in range(101)]
     first_batch_ids = set(document_ids[:100])
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         for index, document_id in enumerate(document_ids):
+            _DOCUMENT_TENANTS[document_id] = tenant_id
             db.add(
                 Document(
                     id=document_id,
@@ -1014,7 +1048,10 @@ async def test_deleted_cleanup_does_not_remove_another_documents_active_generati
     active_document_id = uuid.uuid4()
     active_generation = uuid.uuid4()
     deleted_document_id = uuid.uuid4()
+    _DOCUMENT_TENANTS[active_document_id] = tenant_id
+    _DOCUMENT_TENANTS[deleted_document_id] = tenant_id
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_id)
         db.add_all(
             [
                 Document(

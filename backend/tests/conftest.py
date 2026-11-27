@@ -1,6 +1,29 @@
 import os
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test.db"
+TEST_DB = os.environ.get("TEST_DB", "sqlite").lower()
+if TEST_DB == "postgres":
+    required_test_urls = (
+        "TEST_DATABASE_URL",
+        "TEST_MIGRATION_DATABASE_URL",
+        "TEST_WORKER_DATABASE_URL",
+    )
+    missing_test_urls = [name for name in required_test_urls if not os.environ.get(name)]
+    if missing_test_urls:
+        raise RuntimeError(
+            "PostgreSQL tests require " + ", ".join(missing_test_urls)
+        )
+    os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+    os.environ["MIGRATION_DATABASE_URL"] = os.environ["TEST_MIGRATION_DATABASE_URL"]
+    os.environ["WORKER_DATABASE_URL"] = os.environ["TEST_WORKER_DATABASE_URL"]
+    os.environ.setdefault("APP_DB_PASSWORD", "supportpilot-test-password")
+    os.environ.setdefault("APP_WORKER_DB_PASSWORD", "supportpilot-test-worker-password")
+else:
+    os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test.db"
+    os.environ["MIGRATION_DATABASE_URL"] = ""
+    os.environ["WORKER_DATABASE_URL"] = ""
+    os.environ["APP_DB_PASSWORD"] = "supportpilot-test-password"
+    os.environ["APP_WORKER_DB_PASSWORD"] = "supportpilot-test-worker-password"
+
 os.environ["RAG_MIN_SCORE"] = "0.35"
 os.environ["MIN_CONFIDENCE"] = "0.5"
 os.environ["RAG_TOP_K"] = "4"
@@ -28,20 +51,84 @@ import fakeredis.aioredis  # noqa: E402
 import app.core.redis as redis_mod  # noqa: E402
 import app.storage as storage_mod  # noqa: E402
 
+import asyncio  # noqa: E402
+from pathlib import Path  # noqa: E402
 
+import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.engine import make_url  # noqa: E402
+from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
+from sqlalchemy.pool import NullPool  # noqa: E402
+from alembic import command  # noqa: E402
+from alembic.config import Config  # noqa: E402
 
 from app.db.base import Base  # noqa: E402
 from app.db.session import engine  # noqa: E402
 from app.main import app  # noqa: E402
 
 
+@pytest.fixture(scope="session", autouse=True)
+def postgres_schema():
+    if TEST_DB != "postgres":
+        yield
+        return
+
+    owner_url = make_url(os.environ["TEST_MIGRATION_DATABASE_URL"])
+    database_name = owner_url.database
+    maintenance_url = owner_url.set(database="postgres")
+
+    async def ensure_database():
+        admin_engine = create_async_engine(
+            maintenance_url,
+            poolclass=NullPool,
+        )
+        try:
+            async with admin_engine.connect() as connection:
+                connection = await connection.execution_options(
+                    isolation_level="AUTOCOMMIT"
+                )
+                exists = await connection.scalar(
+                    text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                    {"name": database_name},
+                )
+                if exists is None:
+                    escaped_name = database_name.replace('"', '""')
+                    await connection.exec_driver_sql(
+                        f'CREATE DATABASE "{escaped_name}"'
+                    )
+        finally:
+            await admin_engine.dispose()
+
+    asyncio.run(ensure_database())
+    alembic_config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
+    command.upgrade(alembic_config, "head")
+    yield
+
+
 @pytest_asyncio.fixture(autouse=True)
-async def fresh_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
+async def fresh_db(postgres_schema):
+    if TEST_DB == "postgres":
+        owner_engine = create_async_engine(
+            os.environ["TEST_MIGRATION_DATABASE_URL"],
+            poolclass=NullPool,
+        )
+        try:
+            table_names = [table.name for table in Base.metadata.sorted_tables]
+            quoted_tables = ", ".join(
+                '"' + name.replace('"', '""') + '"' for name in table_names
+            )
+            async with owner_engine.begin() as conn:
+                await conn.execute(
+                    text(f"TRUNCATE TABLE {quoted_tables} RESTART IDENTITY CASCADE")
+                )
+        finally:
+            await owner_engine.dispose()
+    else:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
     yield
 
 
@@ -81,3 +168,12 @@ async def drain_jobs():
                 count += 1
 
     return drain
+
+
+def pytest_collection_modifyitems(config, items):
+    if TEST_DB == "postgres":
+        return
+    skip_postgres = pytest.mark.skip(reason="requires TEST_DB=postgres")
+    for item in items:
+        if item.get_closest_marker("postgres"):
+            item.add_marker(skip_postgres)

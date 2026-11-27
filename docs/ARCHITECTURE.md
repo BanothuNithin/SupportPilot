@@ -1,38 +1,37 @@
 # Architecture (Week 6)
 
-Solid boxes are built. Dashed boxes are planned (week in brackets).
+Solid boxes are implemented. Dashed boxes are planned.
 
 ```mermaid
 flowchart TD
-    UI["Next.js chat, inbox, integrations settings and staff conversation UI"]:::done
-    API["FastAPI: auth, RBAC, tenant-scoped APIs, SSE and persistence"]:::done
-    AG["LangGraph support workflow: rule triage, grader, resolver, escalation"]:::done
-    RAG["Query cleanup, follow-up expansion, embeddings and prompt assembly"]:::done
-    QD[("Qdrant: tenant- and generation-filtered chunks")]:::done
-    LLM["OpenAI-compatible LLM provider (Ollama in local setup)"]:::done
-    MCP["Custom MCP stdio server: create_github_issue, post_slack_alert"]:::done
+    UI["Next.js / TypeScript frontend<br/>chat, inbox, integrations, document states"]:::done
+    API["FastAPI + async SQLAlchemy<br/>JWT auth, tenant APIs, SSE, /health/ready"]:::done
+    AG["LangGraph support workflow<br/>triage, retrieval, grader, resolver, escalation"]:::done
+    LLM["OpenAI-compatible LLM and embedding providers"]:::done
+    PG[("PostgreSQL<br/>tenant data, forced RLS, durable job state")]:::done
+    RD[("Redis<br/>refresh tokens, rate limits, tenant pub/sub,<br/>embedding cache, job wake-ups")]:::done
+    WK["Separate worker using worker_user<br/>atomic claims, leases, retries, reconciliation"]:::done
+    QD[("Qdrant<br/>tenant + active-generation filtered vectors")]:::done
+    S3[("RustFS<br/>S3-compatible original document storage")]:::done
+    MCP["MCP stdio server<br/>GitHub issue and Slack alert tools"]:::done
     GH["GitHub Issues API"]:::done
     SL["Slack incoming webhook"]:::done
-    PG[("PostgreSQL: documents, index generations, tickets and application data")]:::done
-    RD[("Redis: refresh tokens, rate limits, tenant-scoped pub/sub")]:::done
-    WK["Document indexing worker and database reconciler"]:::done
-    S3[("S3-compatible document storage")]:::done
     OBS["Langfuse + RAGAS (Week 7)"]:::planned
 
     UI --> API
     API --> AG
-    API --> RAG
-    AG --> RAG
-    RAG --> QD
     AG --> LLM
-    API --> PG
-    API --> RD
-    API --> S3
-    RD --> WK
-    WK --> PG
-    WK --> S3
-    WK --> QD
-    API -->|"approved action: spawn process; credentials in environment"| MCP
+    AG -->|"tenant + active generations"| QD
+    API -->|"verified JWT tenant context"| PG
+    API <--> RD
+    API <--> S3
+    API -->|"approve and enqueue action"| PG
+    API -->|"best-effort wake-up"| RD
+    RD -->|"wake-up hint"| WK
+    WK -->|"reload, claim, update under tenant context"| PG
+    WK <--> S3
+    WK -->|"publish/reconcile generations"| QD
+    WK -->|"approved action only"| MCP
     MCP --> GH
     MCP --> SL
     AG -.-> OBS
@@ -41,8 +40,20 @@ flowchart TD
     classDef planned fill:#1f2937,stroke:#6b7280,color:#d1d5db,stroke-dasharray: 5 5;
 ```
 
+## Components and security boundaries
+
+- **Frontend:** Next.js/TypeScript chat, staff inbox and integration settings; document status polling, reindexing and downloads; visible chat rate-limit feedback.
+- **API:** FastAPI request handling and async SQLAlchemy persistence. The LangGraph workflow performs deterministic triage, tenant-filtered retrieval, answerability grading, grounded resolution, or ticket escalation. `/health/ready` checks PostgreSQL, Redis, Qdrant, object storage, and runtime-role safety.
+- **PostgreSQL:** source of truth for tenant data, document generations, action status, and durable job state. Atomic compare-and-set claims, leases, bounded retries, and the reconciler recover eligible work.
+- **Redis:** refresh-token storage, fixed-window rate-limit counters, tenant-scoped conversation pub/sub, tenant-keyed query-embedding cache, and queue wake-up notifications. Redis queue messages are hints; workers reload authoritative rows from PostgreSQL.
+- **Worker:** a separate process using `worker_user`. It enumerates tenant IDs through a restricted function, then handles jobs with each tenant's transaction context. It indexes documents and executes approved actions.
+- **Retrieval and storage:** Qdrant searches by tenant and published active generation; PostgreSQL revalidates hits. RustFS provides the local S3-compatible service for original documents.
+- **External actions:** only the worker starts the custom MCP stdio server for approved GitHub/Slack actions. Credentials are supplied through the subprocess environment and are not tool arguments.
+
+Chat rate limiting uses tenant and user fixed-window counters and fails open if Redis is unavailable; login rate limiting uses the default fail-closed behavior. Query-embedding cache keys include the tenant ID and a query/model digest. Redis pub/sub is best-effort and does not replay missed conversation events.
+
 ## Support-agent flow (built)
-1. FastAPI verifies the token, resolves the tenant, saves the customer message, and loads recent conversation history. Exact stored handoff responses are excluded before the latest six messages are passed to the graph.
+1. FastAPI verifies the JWT, takes the tenant ID from its signed claims, and establishes the transaction-local PostgreSQL context before loading the user or conversation. It then saves the customer message and loads recent history. Exact stored handoff responses are excluded before the latest six messages are passed to the graph.
 2. The triage node uses deterministic rules, not an LLM. A detected human request goes directly to escalation; greetings and supported assistant-meta questions go directly to resolution without retrieval.
 3. Other support messages are cleaned for search. Genuine follow-ups are expanded with the most recent prior user question; the original message and conversation wording remain the input to answer generation.
 4. Retrieval loads the tenant's active document generations from PostgreSQL, then searches Qdrant with tenant and document/generation filters plus the configured score threshold. Before returning hits to grading or citation generation, it revalidates each hit's document and generation against PostgreSQL. Documents without a published generation can still use legacy generation-less vectors.
@@ -53,19 +64,22 @@ flowchart TD
 
 The grader is the only LLM completion before answer generation. Fast paths make no grader call; the resolver still uses the configured model provider to generate responses.
 
-## Bug-report proposals and approval (built)
+## Approved-action lifecycle (built)
 
-Bug detection is rule-based. A bug report creates a ticket and a truthful handoff reply. For each configured integration, the application creates a pending action; the AI does not execute external side effects. GitHub issue text includes customer-reported text in a dynamically sized code fence labeled `UNTRUSTED`. Tool arguments are Pydantic-validated and sanitized by the allow-listed registry.
+Bug detection is rule-based. A bug report creates a ticket and a truthful handoff reply. For each configured integration, the application creates a pending proposal; the AI does not execute external side effects. GitHub issue text includes customer-reported text in a dynamically sized code fence labeled `UNTRUSTED`. Tool arguments are Pydantic-validated and sanitized by the allow-listed registry.
 
 ```mermaid
 sequenceDiagram
     participant C as Chat UI (customer simulated in staff chat)
     participant A as FastAPI chat API
     participant G as Rule-based agent
-    participant D as PostgreSQL
+    participant D as PostgreSQL (durable state)
     participant S as Staff conversation UI
     participant O as Owner or Admin
     participant E as Actions API
+    participant R as Redis queue (wake-up hints)
+    participant W as Worker (worker_user)
+    participant RC as Reconciler
     participant M as MCP stdio subprocess
     participant GH as GitHub Issues API
     participant SL as Slack incoming webhook
@@ -82,27 +96,34 @@ sequenceDiagram
     E-->>S: Proposal arguments and status
     O->>E: POST /api/v1/actions/{id}/approve (optional edited arguments)
     E->>D: Atomic compare-and-set pending/failed to approved
-    E->>D: Read tenant-scoped encrypted integration
-    E->>E: Decrypt integration configuration
+    E->>R: Enqueue execute_action hint
+    E-->>S: Return approved action
+    R-->>W: Deliver wake-up hint
+    W->>D: Reload action and atomically claim approved to executing with lease
+    W->>D: Read tenant-scoped encrypted integration under tenant context
+    W->>W: Decrypt integration configuration
     alt GitHub issue action
-        E->>M: Start MCP process; pass GitHub credentials in environment
-        Note over E,M: Tool arguments contain issue text and labels, never credentials
+        W->>M: Start MCP process; pass GitHub credentials in environment
+        Note over W,M: Tool arguments contain issue text and labels, never credentials
         M->>GH: POST issue with validated, sanitized arguments
         GH-->>M: Issue number and URL
     else Slack alert action
-        E->>M: Start MCP process; pass webhook URL in environment
+        W->>M: Start MCP process; pass webhook URL in environment
         M->>SL: POST alert with validated, escaped text
         SL-->>M: Success or HTTP error
     end
-    M-->>E: Tool result or redacted error
-    E->>D: Save executed or failed status and result
-    E-->>S: Return updated action
-    opt Failed action retry
-        O->>E: Approve failed action again
+    M-->>W: Tool result or redacted error
+    W->>D: Save executed or failed status and result
+    RC->>D: Per-tenant scan of stale approved and expired executing actions
+    RC->>R: Requeue stale approved actions if wake-up was lost
+    RC->>D: Mark expired executing action failed with outcome-unknown message
+    Note over RC,D: An uncertain external outcome is not automatically retried
+    opt Human-reviewed retry
+        O->>E: Approve failed action again after checking target system
     end
 ```
 
-The official Python MCP SDK is pinned at `mcp~=1.30.0`. One subprocess is started per approved action. The GitHub and Slack operations are separate proposals and are approved independently. The approval endpoint uses a database compare-and-set so concurrent approvals do not execute the same action twice.
+The official Python MCP SDK is pinned at `mcp~=1.30.0`. One subprocess is started per approved action. The GitHub and Slack operations are separate proposals and are approved independently. The API compare-and-set permits one approval transition; the worker's atomic `approved`-to-`executing` claim prevents duplicate queue deliveries from starting multiple executions. If execution may have reached the external system but the result is unknown, the reconciler marks the action failed and does not retry it automatically. A human can check the target system before deciding whether to approve another attempt.
 
 ## Staff replies and live conversation updates (built)
 
@@ -139,16 +160,20 @@ sequenceDiagram
     participant R as Redis queue
     participant W as Indexing worker
     participant RC as Reconciler
+    participant S3 as RustFS S3-compatible storage
     participant X as Extractor
     participant C as Chunker
     participant E as Embedder
     participant Q as Qdrant
     U->>A: POST /api/v1/documents (file)
+    A->>S3: Store original under generated tenant/document key
     A->>D: Create document with status queued
     A->>R: Best-effort enqueue hint
     A-->>U: 202 Accepted
-    W->>D: Atomic queued-to-indexing claim with fresh UUID token and lease
-    W->>X: Load stored bytes and extract text
+    R-->>W: Wake-up hint (may be lost)
+    W->>D: Reload document; atomic queued-to-indexing claim with UUID token and lease
+    W->>S3: Load stored bytes
+    W->>X: Extract text
     X-->>W: Text
     W->>C: Split paragraphs (800 chars, 100 overlap)
     C-->>W: Chunks
@@ -162,7 +187,7 @@ sequenceDiagram
     else Indexing fails
         W->>D: Set retry/failed only if token and lease still match; retain active_generation
     end
-    RC->>D: Find queued work and expired leases
+    RC->>D: Enumerate tenant IDs and scan each tenant context for queued work and expired leases
     RC->>D: Requeue/fail expired claims; mark abandoned generations
     RC->>R: Best-effort enqueue recovered work
     RC->>Q: Retry tenant/document/generation-specific cleanup
@@ -242,7 +267,7 @@ sequenceDiagram
 ```
 
 ## Data model
-Every business table carries `tenant_id`.
+Every tenant-owned business row carries `tenant_id`; the `tenants` table is scoped by its `id`.
 
 ```mermaid
 erDiagram
@@ -339,9 +364,32 @@ erDiagram
     }
 ```
 
-## Tenant isolation rules
-1. The tenant comes from the verified JWT, never from the request body.
-2. Every query filters by `tenant_id`, through the shared `get_owned` helper for lookups by id.
-3. Another tenant's object returns 404, not 403, so ids cannot be probed.
-4. Vector searches (Week 3) always carry a tenant filter.
-5. Week 6 adds PostgreSQL Row-Level Security as a second line of defense..
+## PostgreSQL tenant isolation and database roles
+
+The verified JWT is the source of request tenant identity, never a request body, path, or header. Ordinary API queries remain tenant-scoped through explicit filters and `get_owned`; unscoped API lookups are limited to restricted authentication functions needed before a tenant is known. Another tenant's object returns 404. Vector searches include tenant and active-generation filters, and hits are revalidated against PostgreSQL.
+
+The SQLAlchemy `after_begin` hook calls `set_config('app.tenant_id', ..., true)` for each PostgreSQL transaction, using the tenant saved on the session. Transaction-local scope avoids carrying a tenant into a later transaction on a pooled connection. RLS is both enabled and forced for `users`, `customers`, `conversations`, `messages`, `tickets`, `documents`, `integrations`, `pending_actions`, `document_index_generations`, and `tenants`. Policies compare each row's `tenant_id` (or `tenants.id`) with this context; setting `app.system` does not bypass them.
+
+```mermaid
+flowchart LR
+    MIG["Privileged migration credentials"] --> MS["Compose migrate service<br/>Alembic + role provisioning"]
+    MS --> DB[("PostgreSQL")]
+
+    API["FastAPI API"] --> AU["app_user<br/>non-owner, NOSUPERUSER,<br/>NOBYPASSRLS"]
+    WK["Worker"] --> WU["worker_user<br/>non-owner, NOSUPERUSER,<br/>NOBYPASSRLS"]
+    AU -->|"ordinary SQL + transaction-local tenant context"| T["10 FORCE RLS tenant tables"]
+    WU -->|"per-tenant work + transaction-local context"| T
+    AU -->|"EXECUTE only"| AF["Restricted auth functions<br/>SECURITY DEFINER"]
+    WU -->|"EXECUTE only"| WF["worker_tenant_ids()"]
+    FO["supportpilot_function_owner<br/>NOLOGIN, not table owner"] --> AF
+    FO --> WF
+    AF --> T
+    WF --> T
+    DB --- T
+```
+
+`supportpilot_function_owner` owns the fixed-search-path `SECURITY DEFINER` functions, not the tenant tables. It is `NOLOGIN` and has `BYPASSRLS` for those narrow function operations. Authentication functions (`auth_email_exists`, `auth_user_for_login`, `auth_user_for_refresh`, and `create_tenant_owner`) are executable by `app_user`; `worker_tenant_ids()` is executable only by `worker_user`. The API role cannot enumerate tenants through the worker function. The worker enumerates tenant IDs, then performs scans and work under each tenant's RLS context.
+
+Migration `c54e2f1d0a6b` enables and forces RLS. Migration `71a08f2c9d4e` removes the system-GUC policy bypass and installs the restricted runtime roles and functions. The dedicated `migrate` Compose service uses privileged `MIGRATION_DATABASE_URL`; neither API nor worker receives migration credentials. The app and worker use `DATABASE_URL` and `WORKER_DATABASE_URL`, respectively.
+
+**Limitation:** the custom `app.tenant_id` GUC is set by the application role. This is defence-in-depth against an accidentally omitted tenant filter, not protection against arbitrary SQL execution under a compromised application role. It does not make SQL injection harmless.

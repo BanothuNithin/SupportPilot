@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, func, or_, select, update
 
 from app.core.config import settings
-from app.db.session import SessionLocal
+from app.db.session import WorkerSessionLocal
+from app.db.tenant import set_tenant, worker_tenant_ids
 from app.models import Document, DocumentIndexGeneration
 from app.rag import store
 from app.storage import get_storage
@@ -25,8 +26,10 @@ async def _generation_is_active(
     document_id: uuid.UUID,
     generation_id: uuid.UUID,
     is_legacy: bool,
+    session_factory=WorkerSessionLocal,
 ) -> bool:
-    async with SessionLocal() as db:
+    async with session_factory() as db:
+        await set_tenant(db, tenant_id)
         row = await db.execute(
             select(Document.active_generation, Document.deleted_at).where(
                 Document.id == document_id,
@@ -47,8 +50,11 @@ async def _delete_generation_record(
     generation_id: uuid.UUID,
     is_legacy: bool,
     now: datetime,
+    session_factory=WorkerSessionLocal,
 ) -> bool:
-    if await _generation_is_active(tenant_id, document_id, generation_id, is_legacy):
+    if await _generation_is_active(
+        tenant_id, document_id, generation_id, is_legacy, session_factory
+    ):
         return False
     try:
         await store.delete_generation(tenant_id, document_id, generation_id)
@@ -62,7 +68,8 @@ async def _delete_generation_record(
         passes = 0
     else:
         passes = 1
-    async with SessionLocal() as db:
+    async with session_factory() as db:
+        await set_tenant(db, tenant_id)
         await db.execute(
             update(DocumentIndexGeneration)
             .where(
@@ -84,23 +91,34 @@ async def _delete_generation_record(
 
 async def cleanup_generations_once(now: datetime | None = None, limit: int = 100) -> int:
     now = now or datetime.now(timezone.utc)
-    async with SessionLocal() as db:
-        rows = (
-            await db.execute(
-                select(
-                    DocumentIndexGeneration.tenant_id,
-                    DocumentIndexGeneration.document_id,
-                    DocumentIndexGeneration.generation_id,
-                    DocumentIndexGeneration.is_legacy,
-                )
-                .where(
-                    DocumentIndexGeneration.status.in_(["retired", "abandoned"]),
-                    DocumentIndexGeneration.cleanup_after <= now,
-                )
-                .order_by(DocumentIndexGeneration.cleanup_after)
-                .limit(limit)
+    async with WorkerSessionLocal() as db:
+        tenants = await worker_tenant_ids(db)
+    rows = []
+    for tenant_id in tenants:
+        async with WorkerSessionLocal() as db:
+            await set_tenant(db, tenant_id)
+            rows.extend(
+                (
+                    await db.execute(
+                        select(
+                            DocumentIndexGeneration.tenant_id,
+                            DocumentIndexGeneration.document_id,
+                            DocumentIndexGeneration.generation_id,
+                            DocumentIndexGeneration.is_legacy,
+                            DocumentIndexGeneration.cleanup_after,
+                        )
+                        .where(
+                            DocumentIndexGeneration.tenant_id == tenant_id,
+                            DocumentIndexGeneration.status.in_(["retired", "abandoned"]),
+                            DocumentIndexGeneration.cleanup_after <= now,
+                        )
+                        .order_by(DocumentIndexGeneration.cleanup_after)
+                        .limit(limit)
+                    )
+                ).all()
             )
-        ).all()
+    rows.sort(key=lambda row: row.cleanup_after)
+    rows = rows[:limit]
     cleaned = 0
     for row in rows:
         if await _delete_generation_record(
@@ -119,6 +137,7 @@ async def cleanup_deleted_documents_once(
     document_id: uuid.UUID | None = None,
     tenant_id: uuid.UUID | None = None,
     limit: int = 100,
+    session_factory=WorkerSessionLocal,
 ) -> int:
     now = now or datetime.now(timezone.utc)
     conditions = [Document.deleted_at.is_not(None)]
@@ -129,19 +148,35 @@ async def cleanup_deleted_documents_once(
     conditions.append(
         or_(Document.cleanup_after.is_(None), Document.cleanup_after <= now)
     )
-    async with SessionLocal() as db:
-        documents = (
-            await db.scalars(
-                select(Document)
-                .where(*conditions)
-                .order_by(func.coalesce(Document.cleanup_after, Document.deleted_at))
-                .limit(limit)
+    if tenant_id is not None:
+        tenants = [tenant_id]
+    else:
+        async with session_factory() as db:
+            tenants = await worker_tenant_ids(db)
+    documents = []
+    for scoped_tenant_id in tenants:
+        scoped_conditions = [*conditions, Document.tenant_id == scoped_tenant_id]
+        async with session_factory() as db:
+            await set_tenant(db, scoped_tenant_id)
+            documents.extend(
+                (
+                    await db.scalars(
+                        select(Document)
+                        .where(*scoped_conditions)
+                        .order_by(func.coalesce(Document.cleanup_after, Document.deleted_at))
+                        .limit(limit)
+                    )
+                ).all()
             )
-        ).all()
+    documents.sort(
+        key=lambda document: document.cleanup_after or document.deleted_at
+    )
+    documents = documents[:limit]
 
     deleted = 0
     for document in documents:
-        async with SessionLocal() as db:
+        async with session_factory() as db:
+            await set_tenant(db, document.tenant_id)
             generations = (
                 await db.scalars(
                     select(DocumentIndexGeneration).where(
@@ -170,7 +205,8 @@ async def cleanup_deleted_documents_once(
                 generation.updated_at = now
             await db.commit()
 
-        async with SessionLocal() as db:
+        async with session_factory() as db:
+            await set_tenant(db, document.tenant_id)
             generations = (
                 await db.execute(
                     select(
@@ -191,6 +227,7 @@ async def cleanup_deleted_documents_once(
                 generation.generation_id,
                 generation.is_legacy,
                 now,
+                session_factory,
             ):
                 all_vectors_cleaned = False
 
@@ -207,7 +244,8 @@ async def cleanup_deleted_documents_once(
                 )
 
         if all_vectors_cleaned and object_cleaned:
-            async with SessionLocal() as db:
+            async with session_factory() as db:
+                await set_tenant(db, document.tenant_id)
                 result = await db.execute(
                     delete(Document).where(
                         Document.id == document.id,
@@ -219,7 +257,8 @@ async def cleanup_deleted_documents_once(
             if result.rowcount == 1:
                 deleted += 1
         else:
-            async with SessionLocal() as db:
+            async with session_factory() as db:
+                await set_tenant(db, document.tenant_id)
                 await db.execute(
                     update(Document)
                     .where(

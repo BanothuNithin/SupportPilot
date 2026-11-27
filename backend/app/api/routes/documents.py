@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, require_roles
 from app.api.tenant import get_owned
 from app.core.config import settings
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.models import Document, DocumentIndexGeneration, Role, User
 from app.rag import store
 from app.rag.extract import ALLOWED_EXTENSIONS
@@ -184,6 +184,7 @@ async def delete_document(
     await cleanup_deleted_documents_once(
         document_id=doc.id,
         tenant_id=user.tenant_id,
+        session_factory=SessionLocal,
     )
 
 

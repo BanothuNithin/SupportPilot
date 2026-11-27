@@ -9,13 +9,14 @@ from sqlalchemy import text
 from app.api.routes import auth, chat, conversations, customers
 from app.api.routes import documents, tickets, integrations, actions
 from app.core import redis as redis_module
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal, engine
 from app.rag import store
 from app.storage import get_storage
 
 import app.models
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="SupportPilot API", version="0.1.0")
 
@@ -43,6 +44,47 @@ async def health():
     return {"status": "ok"}
 
 
+async def verify_rls_database_role() -> None:
+    if engine.dialect.name != "postgresql":
+        return
+    try:
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        "SELECT current_user, role.rolsuper, role.rolbypassrls, "
+                        "EXISTS (SELECT 1 FROM pg_class AS cls "
+                        "JOIN pg_namespace AS ns ON ns.oid = cls.relnamespace "
+                        "WHERE ns.nspname = 'public' "
+                        "AND cls.relname IN "
+                        "('tenants', 'users', 'customers', 'conversations', "
+                        "'messages', 'tickets', 'documents', 'integrations', "
+                        "'pending_actions', 'document_index_generations') "
+                        "AND pg_get_userbyid(cls.relowner) = current_user) "
+                        "AS owns_tenant_table "
+                        "FROM pg_roles AS role WHERE role.rolname = current_user"
+                    )
+                )
+            ).one_or_none()
+    except Exception:
+        log.error("RLS role safety check failed; current database role is unverified")
+        return
+    if (
+        row is None
+        or row.rolsuper
+        or row.rolbypassrls
+        or row.owns_tenant_table
+    ):
+        role_name = row.current_user if row is not None else "unknown"
+        log.error(
+            "UNSAFE DATABASE ROLE %s: owner, superuser or BYPASSRLS privileges disable tenant RLS",
+            role_name,
+        )
+
+
+app.router.on_startup.append(verify_rls_database_role)
+
+
 async def _postgres_ready() -> bool:
     async with SessionLocal() as db:
         await db.execute(text("SELECT 1"))
@@ -62,6 +104,35 @@ async def _storage_ready() -> bool:
     return bool(await get_storage().ping())
 
 
+async def _rls_enforced() -> bool:
+    if engine.dialect.name != "postgresql":
+        return True
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(
+                text(
+                    "SELECT role.rolsuper, role.rolbypassrls, "
+                    "EXISTS (SELECT 1 FROM pg_class AS cls "
+                    "JOIN pg_namespace AS ns ON ns.oid = cls.relnamespace "
+                    "WHERE ns.nspname = 'public' "
+                    "AND cls.relname IN "
+                    "('tenants', 'users', 'customers', 'conversations', "
+                    "'messages', 'tickets', 'documents', 'integrations', "
+                    "'pending_actions', 'document_index_generations') "
+                    "AND pg_get_userbyid(cls.relowner) = current_user) "
+                    "AS owns_tenant_table "
+                    "FROM pg_roles AS role WHERE role.rolname = current_user"
+                )
+            )
+        ).one_or_none()
+    return (
+        row is not None
+        and not row.rolsuper
+        and not row.rolbypassrls
+        and not row.owns_tenant_table
+    )
+
+
 async def _bounded_check(check) -> bool:
     try:
         return await asyncio.wait_for(check(), timeout=2)
@@ -71,8 +142,14 @@ async def _bounded_check(check) -> bool:
 
 @app.get("/health/ready")
 async def health_ready():
-    check_names = ("postgres", "redis", "qdrant", "storage")
-    check_functions = (_postgres_ready, _redis_ready, _qdrant_ready, _storage_ready)
+    check_names = ("postgres", "redis", "qdrant", "storage", "rls_enforced")
+    check_functions = (
+        _postgres_ready,
+        _redis_ready,
+        _qdrant_ready,
+        _storage_ready,
+        _rls_enforced,
+    )
     results = await asyncio.gather(
         *(_bounded_check(check) for check in check_functions)
     )

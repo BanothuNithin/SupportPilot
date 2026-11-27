@@ -9,6 +9,7 @@ from sqlalchemy import select
 from app.core import redis as r
 from app.core.config import settings
 from app.db.session import SessionLocal
+from app.db.tenant import set_tenant
 from app.models import Document
 from app.rag import store
 from app.rag.embeddings import get_embedder
@@ -66,6 +67,7 @@ async def _revalidate_hits(
         return []
 
     async with SessionLocal() as db:
+        await set_tenant(db, tenant_id)
         rows = await db.execute(
             select(Document.id, Document.active_generation).where(
                 Document.tenant_id == tenant_id,

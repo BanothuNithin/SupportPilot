@@ -12,11 +12,14 @@ from app.rag.store import Hit
 from app.llm import get_llm
 from app.llm.fake import FakeProvider
 from sqlalchemy import select
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal as _SessionLocal
 from app.models import Document
 import app.storage as storage_mod
 from app.storage import StorageError
 from app.api.routes import documents as documents_route
+from tests.tenant_test_utils import activate_test_tenant, tenant_scoped_session_factory
+
+SessionLocal = tenant_scoped_session_factory(_SessionLocal)
 
 
 async def register(client, company, email, role=None):
@@ -25,17 +28,20 @@ async def register(client, company, email, role=None):
         json={"company_name": company, "email": email, "password": "password123"},
     )
     assert response.status_code == 201
+    headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+    activate_test_tenant(headers)
     if role is not None:
         invited = await client.post(
             "/api/v1/auth/users",
-            headers={"Authorization": f"Bearer {response.json()['access_token']}"},
+            headers=headers,
             json={"email": f"{role}@{email.split('@')[-1]}", "password": "password123", "role": role},
         )
         assert invited.status_code == 201
-    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+    return headers
 
 
 async def invite_agent(client, owner_headers, email):
+    activate_test_tenant(owner_headers)
     response = await client.post(
         "/api/v1/auth/users",
         headers=owner_headers,
@@ -51,6 +57,7 @@ async def invite_agent(client, owner_headers, email):
 
 
 async def create_conversation(client, headers):
+    activate_test_tenant(headers)
     customer = await client.post(
         "/api/v1/customers",
         headers=headers,
@@ -350,6 +357,7 @@ async def test_download_and_delete_tenant_isolation(client, monkeypatch):
         headers=headers_a,
         files={"file": ("private.txt", b"Private", "text/plain")},
     )
+    activate_test_tenant(headers_a)
     async with SessionLocal() as db:
         doc = await db.scalar(select(Document))
 

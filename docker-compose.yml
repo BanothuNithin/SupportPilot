@@ -29,11 +29,25 @@ services:
     ports: ["9000:9000", "9001:9001"]
     volumes: [s3data:/data]
 
+  migrate:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app_user:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres: { condition: service_healthy }
+    volumes: ["./backend:/app"]
+    command: alembic upgrade head
+
   backend:
     build: ./backend
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql+asyncpg://app_user:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      WORKER_DATABASE_URL: ""
+      APP_WORKER_DB_PASSWORD: ""
+      MIGRATION_DATABASE_URL: ""
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       S3_ENDPOINT: http://s3:9000
@@ -46,6 +60,21 @@ services:
       postgres: { condition: service_healthy }
     volumes: ["./backend:/app"]
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app_user:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      WORKER_DATABASE_URL: postgresql+asyncpg://worker_user:${APP_WORKER_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MIGRATION_DATABASE_URL: ""
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      S3_ENDPOINT: http://s3:9000
+    depends_on:
+      postgres: { condition: service_healthy }
+    volumes: ["./backend:/app"]
+    command: python -m app.worker
 
 volumes:
   pgdata:

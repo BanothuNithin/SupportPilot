@@ -9,6 +9,35 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install -r backend/requirements.txt
       - run: cd backend && pytest -q
+  backend-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DB: postgres
+      TEST_DATABASE_URL: postgresql+asyncpg://app_user:supportpilot-test-password@localhost:5432/supportpilot_test
+      TEST_WORKER_DATABASE_URL: postgresql+asyncpg://worker_user:supportpilot-test-worker-password@localhost:5432/supportpilot_test
+      TEST_MIGRATION_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/supportpilot_test
+      APP_DB_PASSWORD: supportpilot-test-password
+      APP_WORKER_DB_PASSWORD: supportpilot-test-worker-password
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r backend/requirements.txt
+      - run: cd backend && pytest -q
   frontend:
     runs-on: ubuntu-latest
     steps:

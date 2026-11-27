@@ -2,10 +2,11 @@
 
 Each entry: what I chose, what I rejected, and what it costs.
 
-## 1. Shared schema with `tenant_id` on every table
-- **Chose:** one database, one schema, a `tenant_id` column everywhere.
+## 1. Shared schema with `tenant_id` on tenant-owned tables
+- **Chose:** one database, one schema, a `tenant_id` column on tenant-owned rows; the `tenants` table is scoped by its `id`.
 - **Rejected:** schema-per-tenant and database-per-tenant (stronger isolation, much higher operational cost).
-- **Cost:** one missing filter leaks data. **Mitigations:** a shared `get_owned` helper, isolation tests, and Row-Level Security in Week 6.
+- **Why:** shared tables keep migrations and operations manageable while explicit tenant scoping remains part of every business query.
+- **Cost:** one missing filter can expose another tenant's rows. The shared `get_owned` helper, isolation tests, and completed PostgreSQL RLS provide defense in depth. RLS uses an application-settable custom GUC; it does not protect against arbitrary SQL execution under a compromised application role.
 
 ## 2. Tenant identity comes from the JWT, never the request
 - A client cannot claim to be another company. `tenant_id` and role are read from the verified token and database row.
@@ -34,9 +35,11 @@ Each entry: what I chose, what I rejected, and what it costs.
 - `create_all` cannot alter existing tables. Migrations give a versioned, reversible history.
 - Tests still use `create_all` on a throwaway database.
 
-## 9. Tests run on SQLite with a fake Redis
-- **Why:** fast, no services needed, same result locally and in CI.
-- **Cost:** SQLite differs from PostgreSQL (enums, UUIDs, locking). A CI job that runs migrations on real PostgreSQL is planned.
+## 9. Hermetic SQLite tests plus a PostgreSQL CI job
+- **Chose:** keep the default SQLite suite with fake Redis, embeddings, Qdrant, and storage, and run a separate PostgreSQL 16 CI job for PostgreSQL-specific behavior and migrations.
+- **Rejected:** treating SQLite as proof of PostgreSQL RLS, role, locking, or migration behavior.
+- **Why:** the fast suite remains convenient while PostgreSQL tests verify database-specific tenant isolation and role boundaries.
+- **Cost:** the verified results are 257 passed and 11 skipped on SQLite, and 268 passed on PostgreSQL. SQLite does not emulate PostgreSQL RLS, role privileges, enums, UUID behavior, or locking.
 
 ## 10. Bug lesson: patch a name where it is looked up
 - `from module import client` copies the name at import time, so monkeypatching the module did not affect code that had already imported it, and tests silently hit a real Redis.
@@ -95,10 +98,12 @@ Each entry: what I chose, what I rejected, and what it costs.
 - **Rejected:** failing the whole chat request when embeddings or vector search are unavailable.
 - **Cost:** without retrieval, the model has no company-document context for its answer.
 
-## 22. FastAPI BackgroundTasks before a job queue
-- **Chose:** run document indexing as a FastAPI BackgroundTask for now.
-- **Rejected:** adding a separate job queue at this stage.
-- **Cost:** a server restart during indexing can leave a document stuck in `indexing`; a job queue is planned for Week 6.
+## 22. FastAPI BackgroundTasks (superseded by the durable worker)
+- **Original choice:** document indexing first ran as a FastAPI `BackgroundTask`.
+- **Superseded by:** a separate worker that claims PostgreSQL-backed jobs, with Redis used only for wake-up notifications.
+- **Rejected:** relying on request-process memory to retain indexing work.
+- **Why:** an API restart could interrupt work without durable recovery. PostgreSQL status, atomic claims, leases, retries, and reconciliation now let the worker recover indexing jobs independently of the API process.
+- **Cost:** deployments must run and monitor the worker, PostgreSQL, and Redis; Redis messages themselves are not durable.
 
 ## 23. Hermetic tests with fake embeddings
 - **Chose:** use a deterministic fake hashing embedder and force `LLM_PROVIDER=fake`, `EMBED_PROVIDER=fake`, and `QDRANT_URL=:memory:` in tests.
@@ -137,14 +142,16 @@ Each entry: what I chose, what I rejected, and what it costs.
 - **Cost:** history filtering relies on exact matches to the configured handoff text. Prompt rules reduce unsupported claims but are not a formal guarantee; citations and escalation routing remain controlled by the application.
 
 ## 30. AI proposes actions; staff approve them
-- **Chose:** create pending GitHub or Slack proposals for configured integrations when rules detect a bug report. Owners and admins can edit, approve, reject, or retry a failed action.
+- **Chose:** create pending GitHub or Slack proposals for configured integrations when rules detect a bug report. Owners and admins can edit, approve, reject, or re-approve a failed action; approval queues the work for the separate worker.
 - **Rejected:** letting the AI or an MCP tool execute a side effect without explicit staff approval.
-- **Cost:** an issue or alert is not sent until a staff member approves it, so action completion depends on human review. Approved work currently runs in the request rather than a durable worker.
+- **Why:** human authorization remains the gate for external side effects while durable execution no longer depends on the API request lifetime.
+- **Cost:** an issue or alert is not sent until a staff member approves it, so action completion depends on human review and a running worker.
 
 ## 31. Run one MCP stdio subprocess per approved action
-- **Chose:** use the official Python MCP SDK (`mcp~=1.30.0`) and start the custom stdio server for each action. Decrypted credentials are supplied only in the subprocess environment, never in MCP tool arguments.
+- **Chose:** use the official Python MCP SDK (`mcp~=1.30.0`) and start the custom stdio server from the worker for each claimed, approved action. Decrypted credentials are supplied only in the subprocess environment, never in MCP tool arguments.
 - **Rejected:** putting secrets in tool messages or maintaining a long-lived in-process tool server.
-- **Cost:** process startup adds latency and there is no subprocess pool. An action can remain approved if the process crashes before its result is saved.
+- **Why:** worker-side execution isolates external side effects from HTTP request handling and keeps credentials out of MCP arguments.
+- **Cost:** process startup adds latency and there is no subprocess pool. If a worker stops after claiming an action, reconciliation marks an expired execution failed with an outcome-unknown message instead of automatically retrying it.
 
 ## 32. Allow-list and validate executable tools
 - **Chose:** expose only `create_github_issue` and `post_slack_alert` through a registry, validate their arguments with Pydantic, and sanitize text before execution.
@@ -156,10 +163,11 @@ Each entry: what I chose, what I rejected, and what it costs.
 - **Rejected:** storing credentials in plaintext or returning them to prefill the settings UI.
 - **Cost:** the application must retain the environment-provided key to decrypt stored credentials. There is no key rotation or KMS-backed key management yet; losing the key makes the stored credentials unreadable.
 
-## 34. Use an atomic compare-and-set for approval
-- **Chose:** update an action to `approved` with one conditional database update from `pending` or `failed`, and execute only when exactly one row changed.
-- **Rejected:** a read-then-update approval check that could allow concurrent requests to execute the same action twice.
-- **Cost:** this prevents concurrent double approvals, but it does not provide a durable worker or recover an action automatically if the process crashes between approval and completion.
+## 34. Use atomic compare-and-set for approval and worker claim
+- **Chose:** the API conditionally changes `pending` or `failed` to `approved`; after enqueueing a Redis wake-up, the worker conditionally changes `approved` to `executing` with a lease. Each transition proceeds only when exactly one row changed.
+- **Rejected:** read-then-update checks that could race, and treating a Redis message as the action's durable state.
+- **Why:** PostgreSQL serializes approval and execution claims; duplicate deliveries find no `approved` row to claim. The reconciler requeues stale approved actions, while an expired executing action is marked failed as outcome-unknown.
+- **Cost:** an uncertain external result is not automatically retried, which avoids automatic duplicate side effects but can require human investigation. A human-approved retry can intentionally cause a new attempt.
 
 ## 35. Validate Slack webhook destinations from parsed URLs
 - **Chose:** parse the submitted URL and require HTTPS, the exact `hooks.slack.com` hostname, and a path beginning with `/services/`.
@@ -180,3 +188,57 @@ Each entry: what I chose, what I rejected, and what it costs.
 - **Chose:** tell bug reporters that a ticket was created and the team will follow up here, without claiming that GitHub, Slack, or a person was already contacted. Exclude exact stored handoff replies from later model history.
 - **Rejected:** wording that implies an external notification was sent, or feeding a previous handoff back to the model as ordinary assistant content.
 - **Cost:** handoff history filtering relies on exact configured reply text, and the reply cannot guarantee when the team will follow up.
+
+## 39. Use RustFS for local S3-compatible document storage
+- **Chose:** store original document bytes through the S3 storage protocol; Docker Compose runs RustFS as the local S3-compatible service.
+- **Rejected:** keeping uploads only in the API process or tying storage code to one vendor-specific API.
+- **Why:** object storage separates original files from API/worker lifecycles and supports S3-compatible deployments.
+- **Cost/trade-off:** RustFS must be configured and available for local Compose use; production storage choice and operations remain deployment concerns.
+
+## 40. Keep durable job state in PostgreSQL and use Redis for wake-ups
+- **Chose:** PostgreSQL document/action rows are authoritative; Redis carries `type`, `id`, and `tenant_id` wake-up messages.
+- **Rejected:** treating Redis queue contents as the only record that work exists.
+- **Why:** reconciliation can recover queued or stale work from database state if a Redis hint is lost.
+- **Cost/trade-off:** the worker and reconciler must scan database state and coordinate through conditional updates; Redis availability affects promptness, not durable job state.
+
+## 41. Publish document indexes by generation
+- **Chose:** give each indexing claim a UUID token and isolated Qdrant generation; publish it only when the worker still owns the claim and lease. Keep prior active generations searchable until publication, then clean stale generations asynchronously.
+- **Rejected:** writing replacement points into the active generation or trusting Qdrant writes without a PostgreSQL publication pointer.
+- **Why:** concurrent, late, or failed indexing attempts must not replace a valid current document version or make partial vectors searchable.
+- **Cost/trade-off:** generation metadata, leases, and repeated cleanup are required; stale vectors can remain temporarily but are excluded from retrieval until cleanup succeeds.
+
+## 42. Execute approved external actions in the worker at most once automatically
+- **Chose:** approval queues a job; the worker atomically claims it before invoking the GitHub or Slack MCP tool. If execution may have reached the external system but the result is unknown, mark the action failed and require a human decision.
+- **Rejected:** executing external effects in the HTTP request or automatically retrying an uncertain action.
+- **Why:** a retry after an unknown outcome could create duplicate issues or alerts.
+- **Cost/trade-off:** staff may need to inspect GitHub or Slack before re-approving a failed action. A deliberate human retry is a new attempt and may repeat an effect.
+
+## 43. Separate API and worker database roles
+- **Chose:** use `app_user` for the API and `worker_user` for the worker, each with a separate URL/password and without table ownership or `BYPASSRLS`.
+- **Rejected:** running both processes as the migration/database-owner role or sharing one runtime credential.
+- **Why:** least privilege limits each process to its runtime responsibilities while RLS remains active.
+- **Cost/trade-off:** deployments must provision and manage multiple credentials; the worker requires `WORKER_DATABASE_URL` on PostgreSQL.
+
+## 44. Force PostgreSQL RLS with transaction-local tenant context
+- **Chose:** enable and force RLS on all ten tenant tables; set `app.tenant_id` from the verified JWT using transaction-local `set_config`.
+- **Rejected:** relying only on application query filters or using a persistent connection-level tenant setting.
+- **Why:** RLS catches accidentally omitted tenant filters, and transaction-local context avoids leaking tenant state across pooled transactions.
+- **Cost/trade-off:** the tenant GUC is application-settable. This is defence-in-depth, not protection against arbitrary SQL execution under a compromised application role.
+
+## 45. Restrict cross-tenant operations to SECURITY DEFINER functions
+- **Chose:** use fixed-`search_path` functions owned by `supportpilot_function_owner` for cross-tenant authentication lookups and worker tenant enumeration. The owner is `NOLOGIN` and not a tenant-table owner; authentication functions are granted to `app_user` and enumeration only to `worker_user`.
+- **Rejected:** an `app.system` RLS policy bypass or granting runtime roles broad unscoped table access for these operations.
+- **Why:** authentication must find a user before a tenant is known, and a worker must enumerate tenants before per-tenant work; narrow function grants constrain these cases.
+- **Cost/trade-off:** function definitions, ownership, and grants must be carefully maintained in migrations. The function owner has `BYPASSRLS`, so its exposed function surface must remain narrowly scoped.
+
+## 46. Tenant-key the embedding cache and distinguish chat/auth rate limits
+- **Chose:** include tenant ID and query/model digest in embedding-cache keys; apply user and tenant chat limits that fail open on Redis errors, while login rate limiting uses the default fail-closed behavior.
+- **Rejected:** sharing cached vectors across tenants or allowing authentication attempts without rate limiting when Redis is unavailable.
+- **Why:** tenant-keyed caching prevents cross-tenant cache reuse; chat availability and authentication-abuse resistance have different failure trade-offs.
+- **Cost/trade-off:** chat requests can exceed configured limits during Redis outages, and cache misses increase embedding work. Login can be unavailable if its Redis-backed limiter fails.
+
+## 47. Run migrations through a dedicated privileged Compose service
+- **Chose:** use the `migrate` service with `MIGRATION_DATABASE_URL` and `APP_DB_PASSWORD`/`APP_WORKER_DB_PASSWORD` to apply schema changes and provision runtime roles.
+- **Rejected:** passing migration-owner credentials to the API or worker, or running migrations during application startup.
+- **Why:** schema/role changes need elevated database privileges that request and job handlers should not have.
+- **Cost/trade-off:** migrations must be run as a separate deployment step, and privileged credentials require tighter handling than runtime URLs.

@@ -11,7 +11,8 @@ from app.actions.executor import ToolExecutionError, get_tool_executor, redact
 from app.actions.registry import TOOLS, validate_arguments
 from app.actions.sanitize import truncate
 from app.core.config import settings
-from app.db.session import SessionLocal
+from app.db.session import WorkerSessionLocal
+from app.db.tenant import set_tenant
 from app.integrations.service import get_env
 from app.jobs.cleanup import LEGACY_GENERATION_ID
 from app.models import Document, DocumentIndexGeneration, PendingAction, Ticket
@@ -37,7 +38,8 @@ async def handle_index_document(document_id: str | uuid.UUID, tenant_id: str | u
         tenant_id = uuid.UUID(str(tenant_id))
         claim_time = datetime.now(timezone.utc)
         claim_token = uuid.uuid4()
-        async with SessionLocal() as db:
+        async with WorkerSessionLocal() as db:
+            await set_tenant(db, tenant_id)
             result = await db.execute(
                 update(Document)
                 .where(
@@ -65,6 +67,7 @@ async def handle_index_document(document_id: str | uuid.UUID, tenant_id: str | u
                 await db.rollback()
                 return
             storage_key, filename, attempts, active_generation = claimed
+            await set_tenant(db, tenant_id)
             db.add(
                 DocumentIndexGeneration(
                     tenant_id=tenant_id,
@@ -178,7 +181,8 @@ async def _renew_lease(
         await asyncio.sleep(interval)
         now = datetime.now(timezone.utc)
         try:
-            async with SessionLocal() as db:
+            async with WorkerSessionLocal() as db:
+                await set_tenant(db, tenant_id)
                 result = await db.execute(
                     update(Document)
                     .where(
@@ -215,7 +219,8 @@ async def _publish_generation(
     chunk_count: int,
 ) -> bool:
     now = datetime.now(timezone.utc)
-    async with SessionLocal() as db:
+    async with WorkerSessionLocal() as db:
+        await set_tenant(db, tenant_id)
         current = await db.scalar(
             select(Document.active_generation).where(
                 Document.id == document_id,
@@ -312,7 +317,8 @@ async def _set_queued(
     document_id: uuid.UUID, tenant_id: uuid.UUID, claim_token: uuid.UUID
 ) -> None:
     now = datetime.now(timezone.utc)
-    async with SessionLocal() as db:
+    async with WorkerSessionLocal() as db:
+        await set_tenant(db, tenant_id)
         await db.execute(
             update(Document)
             .where(
@@ -341,7 +347,8 @@ async def _set_failed(
     message: str,
 ) -> None:
     now = datetime.now(timezone.utc)
-    async with SessionLocal() as db:
+    async with WorkerSessionLocal() as db:
+        await set_tenant(db, tenant_id)
         await db.execute(
             update(Document)
             .where(
@@ -376,7 +383,8 @@ async def handle_execute_action(
         tenant_uuid = uuid.UUID(str(tenant_id))
         claim_time = datetime.now(timezone.utc)
         locked_until = claim_time + timedelta(seconds=settings.job_lease_seconds)
-        async with SessionLocal() as db:
+        async with WorkerSessionLocal() as db:
+            await set_tenant(db, tenant_uuid)
             claim = await db.execute(
                 update(PendingAction)
                 .where(
@@ -402,6 +410,7 @@ async def handle_execute_action(
                 return
             row_tenant_id, tool, serialized_arguments, ticket_id = row
             claimed_tenant_id = row_tenant_id
+            await set_tenant(db, row_tenant_id)
             await db.commit()
 
         spec = TOOLS.get(tool)
@@ -410,7 +419,8 @@ async def handle_execute_action(
             outcome = "failed"
             return
 
-        async with SessionLocal() as db:
+        async with WorkerSessionLocal() as db:
+            await set_tenant(db, row_tenant_id)
             env = await get_env(db, row_tenant_id, spec.integration_kind)
         if env is None:
             await _fail_action(action_uuid, row_tenant_id, "Integration not configured")
@@ -443,7 +453,8 @@ async def handle_execute_action(
             return
 
         finished_at = datetime.now(timezone.utc)
-        async with SessionLocal() as db:
+        async with WorkerSessionLocal() as db:
+            await set_tenant(db, row_tenant_id)
             finalized = await db.execute(
                 update(PendingAction)
                 .where(
@@ -511,7 +522,8 @@ async def _fail_action(
     action_id: uuid.UUID, tenant_id: uuid.UUID, error: str
 ) -> None:
     now = datetime.now(timezone.utc)
-    async with SessionLocal() as db:
+    async with WorkerSessionLocal() as db:
+        await set_tenant(db, tenant_id)
         await db.execute(
             update(PendingAction)
             .where(

@@ -1,9 +1,10 @@
 import re
 import uuid
+from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, require_roles
@@ -22,11 +23,71 @@ def _slugify(name: str) -> str:
     return f"{base}-{uuid.uuid4().hex[:6]}"
 
 
+@dataclass(frozen=True)
+class AuthIdentity:
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    role: Role
+    hashed_password: str | None = None
+
+
 async def _email_taken(db: AsyncSession, email: str) -> bool:
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        return bool(
+            await db.scalar(
+                text("SELECT public.auth_email_exists(:email)"),
+                {"email": email},
+            )
+        )
     return (await db.scalar(select(User.id).where(User.email == email))) is not None
 
 
-async def _token_pair(user: User) -> TokenOut:
+async def _user_for_login(db: AsyncSession, email: str) -> AuthIdentity | None:
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        row = (
+            await db.execute(
+                text("SELECT * FROM public.auth_user_for_login(:email)"),
+                {"email": email},
+            )
+        ).mappings().one_or_none()
+        if row is None:
+            return None
+        return AuthIdentity(
+            id=row["id"],
+            tenant_id=row["tenant_id"],
+            role=Role(row["role"]),
+            hashed_password=row["hashed_password"],
+        )
+    user = await db.scalar(select(User).where(User.email == email))
+    if user is None:
+        return None
+    return AuthIdentity(user.id, user.tenant_id, user.role, user.hashed_password)
+
+
+async def _user_for_refresh(
+    db: AsyncSession, user_id: uuid.UUID
+) -> AuthIdentity | None:
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        row = (
+            await db.execute(
+                text("SELECT * FROM public.auth_user_for_refresh(:user_id)"),
+                {"user_id": user_id},
+            )
+        ).mappings().one_or_none()
+        if row is None:
+            return None
+        return AuthIdentity(
+            id=row["id"],
+            tenant_id=row["tenant_id"],
+            role=Role(row["role"]),
+        )
+    user = await db.get(User, user_id)
+    if user is None:
+        return None
+    return AuthIdentity(user.id, user.tenant_id, user.role)
+
+
+async def _token_pair(user: AuthIdentity) -> TokenOut:
     return TokenOut(
         access_token=create_access_token(str(user.id), str(user.tenant_id), user.role.value),
         refresh_token=await issue_refresh_token(str(user.id)),
@@ -38,25 +99,49 @@ async def register(body: RegisterIn, db: AsyncSession = Depends(get_db)):
     """Create a new tenant (company) and its owner in one step."""
     if await _email_taken(db, body.email):
         raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
-    tenant = Tenant(name=body.company_name, slug=_slugify(body.company_name))
-    db.add(tenant)
-    await db.flush()
-    user = User(
-        tenant_id=tenant.id,
-        email=body.email,
-        hashed_password=hash_password(body.password),
-        role=Role.owner,
-    )
-    db.add(user)
-    await db.commit()
+    password_hash = hash_password(body.password)
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        row = (
+            await db.execute(
+                text(
+                    "SELECT * FROM public.create_tenant_owner("
+                    ":name, :slug, :email, :hashed_password)"
+                ),
+                {
+                    "name": body.company_name,
+                    "slug": _slugify(body.company_name),
+                    "email": body.email,
+                    "hashed_password": password_hash,
+                },
+            )
+        ).mappings().one()
+        user = AuthIdentity(row["id"], row["tenant_id"], Role(row["role"]))
+        await db.commit()
+    else:
+        tenant = Tenant(name=body.company_name, slug=_slugify(body.company_name))
+        db.add(tenant)
+        await db.flush()
+        db_user = User(
+            tenant_id=tenant.id,
+            email=body.email,
+            hashed_password=password_hash,
+            role=Role.owner,
+        )
+        db.add(db_user)
+        await db.commit()
+        user = AuthIdentity(db_user.id, tenant.id, db_user.role)
     return await _token_pair(user)
 
 
 @router.post("/login", response_model=TokenOut)
 async def login(request: Request, form: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
     await rate_limit(f"login:{request.client.host}", limit=5, window_seconds=60)
-    user = await db.scalar(select(User).where(User.email == form.username))
-    if not user or not verify_password(form.password, user.hashed_password):
+    user = await _user_for_login(db, form.username)
+    if (
+        user is None
+        or user.hashed_password is None
+        or not verify_password(form.password, user.hashed_password)
+    ):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
     return await _token_pair(user)
 
@@ -70,7 +155,7 @@ async def refresh(body: RefreshIn, db: AsyncSession = Depends(get_db)):
         user_uuid = uuid.UUID(user_id)
     except ValueError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired refresh token")
-    user = await db.get(User, user_uuid)
+    user = await _user_for_refresh(db, user_uuid)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired refresh token")
     return await _token_pair(user)

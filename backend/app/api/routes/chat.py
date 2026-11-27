@@ -23,6 +23,7 @@ from app.api.tenant import get_owned
 from app.core.config import settings
 from app.core.ratelimit import rate_limit
 from app.db.session import SessionLocal, get_db
+from app.db.tenant import set_tenant
 from app.llm import get_llm
 from app.llm.base import LLMError, LLMProvider
 from app.models import Conversation, Document, Message, PendingAction, Ticket, User
@@ -89,6 +90,7 @@ async def persist_reply(
 ) -> tuple[str, str | None, datetime]:
     """Save the AI reply and escalation state in one transaction."""
     async with SessionLocal() as session:
+        await set_tenant(session, tenant_id)
         msg = Message(
             tenant_id=tenant_id,
             conversation_id=conv_id,

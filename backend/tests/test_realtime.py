@@ -7,10 +7,13 @@ import pytest
 from sqlalchemy import select
 
 import app.core.redis as redis_mod
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal as _SessionLocal
 from app.main import app
 from app.models import Conversation, Message, PendingAction, Ticket
 from app.realtime import channel, conversation_events, publish_message
+from tests.tenant_test_utils import activate_test_tenant, tenant_scoped_session_factory
+
+SessionLocal = tenant_scoped_session_factory(_SessionLocal)
 
 
 async def register(client, company, email, role=None):
@@ -20,6 +23,7 @@ async def register(client, company, email, role=None):
     )
     assert response.status_code == 201
     owner = {"Authorization": f"Bearer {response.json()['access_token']}"}
+    activate_test_tenant(owner)
     if role is None:
         return owner
     invited = await client.post(
@@ -36,6 +40,7 @@ async def register(client, company, email, role=None):
 
 
 async def create_conversation(client, headers):
+    activate_test_tenant(headers)
     customer = await client.post(
         "/api/v1/customers",
         headers=headers,
@@ -51,6 +56,7 @@ async def create_conversation(client, headers):
 
 
 async def escalate(client, headers, conversation_id, text="The app crashes"):
+    activate_test_tenant(headers)
     response = await client.post(
         f"/api/v1/conversations/{conversation_id}/messages",
         headers=headers,

@@ -3,6 +3,7 @@ import uuid
 import pytest
 
 from app.db.session import SessionLocal
+from tests.tenant_test_utils import set_test_tenant
 from app.models import PendingAction, Ticket
 
 
@@ -62,9 +63,12 @@ async def create_test_data(client):
     tenant_b = uuid.UUID((await client.get("/api/v1/auth/me", headers=owner_b)).json()["tenant_id"])
 
     async with SessionLocal() as db:
+        await set_test_tenant(db, tenant_a)
         ticket_a1, pending_a1 = await create_action(db, tenant_a, conversation_a1)
         _, failed_a1 = await create_action(db, tenant_a, conversation_a1, status="failed")
         _, pending_a2 = await create_action(db, tenant_a, conversation_a2)
+        await db.commit()
+        await set_test_tenant(db, tenant_b)
         _, pending_b = await create_action(db, tenant_b, conversation_b)
         await db.commit()
     return {

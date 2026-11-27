@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_token
 from app.db.session import get_db
+from app.db.tenant import set_tenant
 from app.models import Role, User
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
@@ -18,10 +19,12 @@ async def get_current_user(
     err = HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
     try:
         payload = decode_token(token)
+        tenant_id = uuid.UUID(payload["tid"])
+        await set_tenant(db, tenant_id)
         user = await db.get(User, uuid.UUID(payload["sub"]))
-    except (jwt.PyJWTError, KeyError, ValueError):
+    except (jwt.PyJWTError, KeyError, TypeError, ValueError):
         raise err
-    if user is None:
+    if user is None or user.tenant_id != tenant_id:
         raise err
     return user
 

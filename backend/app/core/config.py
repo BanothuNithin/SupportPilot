@@ -5,6 +5,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=('.env', '../.env'), extra='ignore')
 
     database_url: str = "sqlite+aiosqlite:///./dev.db"
+    migration_database_url: str | None = None
+    worker_database_url: str | None = None
     redis_url: str = "redis://localhost:6379/0"
     qdrant_url: str = "http://localhost:6333"
     jwt_secret: str = "dev-secret-change-me-use-32-chars-min!!"

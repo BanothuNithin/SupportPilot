@@ -1,7 +1,10 @@
 import uuid
 
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal as _SessionLocal
 from app.models import Conversation
+from tests.tenant_test_utils import activate_test_tenant, tenant_scoped_session_factory
+
+SessionLocal = tenant_scoped_session_factory(_SessionLocal)
 
 
 async def register(client, company, email, password="password123"):
@@ -10,7 +13,9 @@ async def register(client, company, email, password="password123"):
         json={"company_name": company, "email": email, "password": password},
     )
     assert response.status_code == 201
-    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+    headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+    activate_test_tenant(headers)
+    return headers
 
 
 async def create_customer(client, headers):

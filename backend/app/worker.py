@@ -3,7 +3,10 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
+from sqlalchemy import text
+
 from app.core.config import settings
+from app.db.session import WorkerSessionLocal, worker_engine
 from app.jobs.handlers import handle_execute_action, handle_index_document
 from app.jobs.queue import dequeue
 from app.jobs.reconciler import reconcile_once
@@ -59,6 +62,46 @@ async def run_worker(
     stop: asyncio.Event | None = None,
     concurrency: int | None = None,
 ) -> None:
+    if worker_engine.dialect.name == "postgresql":
+        if not settings.worker_database_url:
+            raise RuntimeError("WORKER_DATABASE_URL is required for PostgreSQL workers")
+
+        async with WorkerSessionLocal() as db:
+            role = (
+                await db.execute(
+                    text(
+                        "SELECT current_user, role.rolsuper, role.rolbypassrls, "
+                        "EXISTS ("
+                        "SELECT 1 FROM pg_class AS cls "
+                        "JOIN pg_namespace AS ns ON ns.oid = cls.relnamespace "
+                        "WHERE ns.nspname = 'public' "
+                        "AND cls.relname IN ("
+                        "'tenants', 'users', 'customers', 'conversations', "
+                        "'messages', 'tickets', 'documents', 'integrations', "
+                        "'pending_actions', 'document_index_generations' "
+                        ") "
+                        "AND pg_get_userbyid(cls.relowner) = current_user"
+                        ") AS owns_tenant_table, "
+                        "EXISTS ("
+                        "SELECT 1 FROM pg_auth_members AS membership "
+                        "WHERE membership.member = role.oid"
+                        ") AS has_role_memberships "
+                        "FROM pg_roles AS role "
+                        "WHERE role.rolname = current_user"
+                    )
+                )
+            ).one()
+
+        if (
+            role.current_user != "worker_user"
+            or role.rolsuper
+            or role.rolbypassrls
+            or role.owns_tenant_table
+            or role.has_role_memberships
+        ):
+            raise RuntimeError(
+                "Worker database role must be non-owner and RLS-restricted"
+            )
     stop = stop or asyncio.Event()
     semaphore = asyncio.Semaphore(concurrency or settings.worker_concurrency)
     in_flight: set[asyncio.Task] = set()
